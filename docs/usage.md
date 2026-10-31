@@ -225,17 +225,17 @@ CAPS = "FN(2)"            # momentary layer, absolute number (m1 = 0..3)
 [m1.fn2]
 I = "UP"
 S = "LSFT"
-M = "MACRO(0)"
+M = "MACRO(1)"
 "#58" = "LCTL+C"
 
 [m1.travel]
 "*" = { actuation = 1.5, trigger = "normal" }
 W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
 
-[m1.macros]               # 0..31, bound to a key as MACRO(n)
-4 = "LCTL+C"              # chord: modifiers down, key tap, modifiers up
-2 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]   # steps, delay in ms
-3 = []                    # empty
+[m1.macros]               # 1..32 as NuPhy IO numbers them, bound as MACRO(n)
+5 = "LCTL+C"              # chord: modifiers down, key tap, modifiers up
+3 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]   # steps, delay in ms
+4 = []                    # empty
 ```
 
 A layer can also be named the way NuPhy IO numbers them across modes:

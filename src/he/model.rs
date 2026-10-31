@@ -553,9 +553,9 @@ pub struct Config {
 /// "*" = { actuation = 1.5, trigger = "normal" }
 /// W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
 ///
-/// [m1.macros]               # 0..31; a chord, or explicit steps with delays
-/// 0 = "LCTL+Z"
-/// 2 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]
+/// [m1.macros]               # 1..32 as in NuPhy IO; a chord, or steps with delays
+/// 1 = "LCTL+Z"
+/// 3 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]
 /// ```
 pub fn parse_config(text: &str) -> Result<Config> {
     let table: toml::Table = text.parse().context("invalid TOML")?;
@@ -578,10 +578,13 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 for (key, value) in keys {
                     let source = format!("{mode_key}.macros.{key}");
                     let index: usize = key
-                        .parse()
+                        .parse::<usize>()
                         .ok()
-                        .filter(|&i| i < MACRO_COUNT)
-                        .with_context(|| format!("{source}: macro numbers are 0..{MACRO_COUNT}"))?;
+                        .filter(|&n| (1..=MACRO_COUNT).contains(&n))
+                        .map(|n| n - 1)
+                        .with_context(|| {
+                            format!("{source}: macro numbers are 1..={MACRO_COUNT}")
+                        })?;
                     config
                         .macros
                         .insert((mode, index), Macro::parse(value, &source)?);
@@ -677,7 +680,7 @@ impl MacroChange {
         format!(
             "{}.macros {}: {} -> {}",
             mode_label(self.mode),
-            self.index,
+            self.index + 1,
             show(&self.from),
             show(&self.to)
         )
@@ -950,7 +953,7 @@ pub fn export_config(
             out.push_str(&format!("\n[{m}.macros]\n"));
             for (index, mac) in list.iter().enumerate() {
                 if !mac.0.is_empty() {
-                    out.push_str(&format!("{index} = {}\n", mac.to_toml()));
+                    out.push_str(&format!("{} = {}\n", index + 1, mac.to_toml()));
                 }
             }
         }
@@ -1107,7 +1110,7 @@ mod tests {
         W = { actuation = 0.5, trigger = "rapid", press = 0.1 }
 
         [m1.macros]
-        0 = "LCTL+Z"
+        1 = "LCTL+Z"
     "##;
 
     #[test]
@@ -1136,7 +1139,8 @@ mod tests {
         assert!(parse_config("[m1.travel]\nW = { actuation = \"x\" }").is_err());
         assert!(parse_config("[m1.travel]\nW = { speed = 1 }").is_err());
         assert!(parse_config("[m1.travel]\nW = { trigger = \"fast\" }").is_err());
-        assert!(parse_config("[m1.macros]\n32 = \"LCTL+C\"").is_err());
+        assert!(parse_config("[m1.macros]\n33 = \"LCTL+C\"").is_err());
+        assert!(parse_config("[m1.macros]\n0 = \"LCTL+C\"").is_err());
         assert!(parse_config("[m1.macros]\n0 = [\"C sideways\"]").is_err());
     }
 
@@ -1255,7 +1259,7 @@ mod tests {
 
         let text = export_config(&[0], &current, &factory, &travel, &macros).unwrap();
         assert!(text.contains("[m1.base]\nCAPS = \"FN(2)\""), "{text}");
-        assert!(text.contains("[m1.macros]\n4 = \"LCTL+C\""), "{text}");
+        assert!(text.contains("[m1.macros]\n5 = \"LCTL+C\""), "{text}");
         assert!(
             text.contains("\"*\" = { actuation = 1.5, trigger = \"normal\""),
             "{text}"

@@ -3,7 +3,7 @@
 //! - `10 mods hid`: a keyboard key, `mods` a modifier bitmask, `hid` a HID
 //!   keyboard usage (`10 02 00` is Left Shift alone, `10 01 06` Ctrl+C).
 //! - `30 lo hi`: a consumer-control usage (`30 e2 00` Mute).
-//! - `70 n ff`: macro slot `n`.
+//! - `70 n ff`: macro slot `n`, shown 1-based as NuPhy IO does (`MACRO(1)`).
 //! - `f0 ff n`: momentary layer `n` (absolute layer number, 0..=11).
 //! - `f0 f 00`: a keyboard function (lighting, sleep, mode switch, ...).
 //! - Anything else (DKS, Toggle, Mod-Tap, Snap Tap, mouse, ...) is shown and
@@ -147,7 +147,7 @@ impl fmt::Display for Action {
                     None => write!(f, "CONSUMER(0x{usage:03x})"),
                 }
             }
-            KIND_MACRO if b == 0xff => write!(f, "MACRO({a})"),
+            KIND_MACRO if b == 0xff => write!(f, "MACRO({})", u16::from(a) + 1),
             KIND_FUNCTION if a == FN_LAYER => write!(f, "FN({b})"),
             KIND_FUNCTION if b == 0 => match FUNCTIONS.iter().find(|x| x.0 == a) {
                 Some((_, name, _)) => f.write_str(name),
@@ -198,9 +198,12 @@ impl std::str::FromStr for Action {
             return Ok(Self([KIND_FUNCTION, FN_LAYER, layer as u8]));
         }
         if let Some(n) = call(s, "MACRO") {
-            let slot = parse_number(n)?;
-            let slot = u8::try_from(slot).ok().filter(|&n| n < 0xff);
-            let slot = slot.with_context(|| format!("macro slot out of range in {s:?}"))?;
+            let number = parse_number(n)?;
+            let slot = u8::try_from(number.wrapping_sub(1))
+                .ok()
+                .filter(|&n| n < 0xff);
+            let slot =
+                slot.with_context(|| format!("macro number out of range in {s:?} (from 1)"))?;
             return Ok(Self([KIND_MACRO, slot, 0xff]));
         }
         if let Some(n) = call(s, "CONSUMER") {
@@ -265,7 +268,7 @@ mod tests {
         assert_eq!(a([0x10, 0, 0x65]).to_string(), "APP");
         assert_eq!(a([0x30, 0xe2, 0]).to_string(), "MUTE");
         assert_eq!(a([0x30, 0x9f, 0x02]).to_string(), "MISSION_CONTROL");
-        assert_eq!(a([0x70, 3, 0xff]).to_string(), "MACRO(3)");
+        assert_eq!(a([0x70, 3, 0xff]).to_string(), "MACRO(4)");
         assert_eq!(a([0xf0, 0xff, 2]).to_string(), "FN(2)");
         assert_eq!(a([0xf0, 0x52, 0]).to_string(), "SLEEP");
         assert_eq!(a([0xf0, 0x08, 0]).to_string(), "FACTORY_RESET");
@@ -280,7 +283,8 @@ mod tests {
         assert_eq!("kc_lshift".parse::<Action>().unwrap(), a([0x10, 0x02, 0]));
         assert_eq!("VOLU".parse::<Action>().unwrap(), a([0x30, 0xe9, 0]));
         assert_eq!("FN(9)".parse::<Action>().unwrap(), a([0xf0, 0xff, 9]));
-        assert_eq!("macro(0)".parse::<Action>().unwrap(), a([0x70, 0, 0xff]));
+        assert_eq!("macro(1)".parse::<Action>().unwrap(), a([0x70, 0, 0xff]));
+        assert!("MACRO(0)".parse::<Action>().is_err());
         assert_eq!("0x950020".parse::<Action>().unwrap(), a([0x95, 0, 0x20]));
         assert_eq!("NO".parse::<Action>().unwrap(), Action::NONE);
         assert!("FN(12)".parse::<Action>().is_err());
