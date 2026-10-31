@@ -208,6 +208,7 @@ nuphyctl he info
 nuphyctl he dump --mode m1 --changed
 nuphyctl he travel --mode m2
 nuphyctl he export > air60he.toml
+nuphyctl he check air60he.toml          # offline: parses, ranges, unmanaged actions
 nuphyctl he apply air60he.toml --dry-run
 nuphyctl he apply air60he.toml
 nuphyctl he restore-backup ~/.local/state/nuphyctl/he-<stamp>.bin

@@ -491,6 +491,8 @@ pub enum HeSubcommand {
     Travel(HeTravelArgs),
     /// Print changed actions and the travel table as an `apply` TOML file
     Export(HeExportArgs),
+    /// Validate a TOML file without a keyboard
+    Check(HeCheckArgs),
     /// Apply a declarative TOML file (only listed keys and fields are touched)
     Apply(HeApplyArgs),
     /// Write an `he` backup back to the keyboard (only differing entries)
@@ -547,6 +549,12 @@ pub struct HeExportArgs {
 
     #[command(flatten)]
     pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeCheckArgs {
+    /// TOML file to validate
+    pub file: PathBuf,
 }
 
 #[derive(Args, Debug)]

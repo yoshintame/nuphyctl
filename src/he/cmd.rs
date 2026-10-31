@@ -1,13 +1,13 @@
 //! `nuphyctl he ...` command handlers.
 
 use crate::cli::{
-    DeviceSelector, HeApplyArgs, HeDumpArgs, HeExportArgs, HeInfoArgs, HeRestoreBackupArgs,
-    HeTravelArgs,
+    DeviceSelector, HeApplyArgs, HeCheckArgs, HeDumpArgs, HeExportArgs, HeInfoArgs,
+    HeRestoreBackupArgs, HeTravelArgs,
 };
 use crate::he::model::{
-    ActionChange, LAYER_NAMES, Matrix, TRIGGERS, Travel, TravelChange, export_config, key_count,
-    mode_label, parse_config, parse_mode, plan_action_writes, plan_changes, plan_travel_writes,
-    position_name,
+    ActionChange, LAYER_NAMES, Matrix, TRIGGERS, Travel, TravelChange, check_config, export_config,
+    key_count, mode_label, parse_config, parse_mode, plan_action_writes, plan_changes,
+    plan_travel_writes, position_name,
 };
 use crate::he::protocol::{
     Base, CMD_GET_DEFAULT_MATRIX, CMD_GET_TRAVEL, CMD_GET_USE_MATRIX, CMD_SET_TRAVEL,
@@ -284,6 +284,24 @@ pub fn run_export(api: &HidApi, args: &HeExportArgs) -> Result<()> {
         print!("{}", export_config(&modes, &current, &factory, &travel));
         Ok(())
     })
+}
+
+pub fn run_check(args: &HeCheckArgs) -> Result<()> {
+    let text = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("failed to read {}", args.file.display()))?;
+    let config =
+        parse_config(&text).with_context(|| format!("invalid config {}", args.file.display()))?;
+    let notes =
+        check_config(&config).with_context(|| format!("invalid config {}", args.file.display()))?;
+    for note in &notes {
+        println!("note: {note}");
+    }
+    println!(
+        "ok: {} key action(s), {} travel entr(ies)",
+        config.actions.len(),
+        config.travel.len()
+    );
+    Ok(())
 }
 
 pub fn run_apply(api: &HidApi, args: &HeApplyArgs) -> Result<()> {

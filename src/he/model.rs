@@ -665,6 +665,31 @@ pub fn plan_changes(
     Ok((actions, records))
 }
 
+/// Offline checks of a parsed config: every travel entry must fit a record
+/// (ranges and steps of a stock record), and actions this tool does not write
+/// are listed, since `apply` accepts them only where the keyboard already
+/// holds them.
+pub fn check_config(config: &Config) -> Result<Vec<String>> {
+    let stock = TravelRecord([0xa2, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    for (&(mode, slot), spec) in &config.travel {
+        spec.apply_to(stock)
+            .with_context(|| format!("{}.travel {}", mode_label(mode), position_name(slot)))?;
+    }
+    Ok(config
+        .actions
+        .iter()
+        .filter(|(_, a)| !a.is_writable())
+        .map(|(&(mode, layer, slot), a)| {
+            format!(
+                "{}.{} {} = {a}: not written by this tool; apply passes only if the keyboard already holds it",
+                mode_label(mode),
+                LAYER_NAMES[usize::from(layer)],
+                position_name(slot)
+            )
+        })
+        .collect())
+}
+
 /// One write: the region's byte address and payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteChunk {
@@ -943,6 +968,20 @@ mod tests {
         let config = parse_config("[m1.base]\nESC = \"0x950020\"").unwrap();
         let (a, _) = plan_changes(&config, &matrix, &travel).unwrap();
         assert!(a.is_empty());
+    }
+
+    #[test]
+    fn checks_config_offline() {
+        let notes = check_config(&parse_config(SAMPLE).unwrap()).unwrap();
+        assert!(notes.is_empty());
+        let notes = check_config(&parse_config("[m2.base]\nS = \"0x950020\"").unwrap()).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            check_config(&parse_config("[m1.travel]\nW = { actuation = 3.5 }").unwrap()).is_err()
+        );
+        assert!(
+            check_config(&parse_config("[m1.travel]\nW = { press = 0.015 }").unwrap()).is_err()
+        );
     }
 
     #[test]

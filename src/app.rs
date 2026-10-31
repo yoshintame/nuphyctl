@@ -81,6 +81,7 @@ pub fn run(cli: Cli, api: &HidApi) -> Result<()> {
             HeSubcommand::Dump(args) => he::cmd::run_dump(api, &args),
             HeSubcommand::Travel(args) => he::cmd::run_travel(api, &args),
             HeSubcommand::Export(args) => he::cmd::run_export(api, &args),
+            HeSubcommand::Check(args) => he::cmd::run_check(&args),
             HeSubcommand::Apply(args) => he::cmd::run_apply(api, &args),
             HeSubcommand::RestoreBackup(args) => he::cmd::run_restore_backup(api, &args),
         },
@@ -401,6 +402,7 @@ fn print_commands() {
         "he dump",
         "he travel",
         "he export",
+        "he check",
         "he apply",
         "he restore-backup",
     ];
