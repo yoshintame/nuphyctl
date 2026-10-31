@@ -1,6 +1,7 @@
 //! `nuphyctl keymap ...` command handlers.
 
 use crate::app::is_retryable_rgb_error;
+use crate::backup::{default_backup_dir, write_backup};
 use crate::cli::{
     DeviceSelector, KeymapApplyArgs, KeymapDumpArgs, KeymapExportArgs, KeymapInfoArgs,
     KeymapListArgs, KeymapResetArgs, KeymapResetMode, KeymapRestoreBackupArgs, KeymapSetArgs,
@@ -9,8 +10,7 @@ use crate::hid_transport::{clear_input_reports, open_selected_device};
 use crate::keycodes::{KEYCODES, format_hex, keycode_name, parse_keycode};
 use crate::keymap::{
     AIR75_V3_POSITIONS, Assignment, Change, Geometry, Keymap, Layout, apply_changes,
-    default_backup_dir, diff_assignments, diff_keymaps, export_config, parse_config,
-    parse_layer_spec, plan_writes, write_backup,
+    diff_assignments, diff_keymaps, export_config, parse_config, parse_layer_spec, plan_writes,
 };
 use crate::nuphy_protocol::{KeyboardProtocol, format_firmware_version};
 use anyhow::{Context, Result, bail};
@@ -137,7 +137,7 @@ fn backup_keymap(keymap: &Keymap) -> Result<PathBuf> {
         .context("failed to save keymap backup; nothing was written")
 }
 
-fn print_json(value: &Value) -> Result<()> {
+pub(crate) fn print_json(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }

@@ -246,14 +246,24 @@ Actions are key names with optional modifiers (`LCTL+C`), media names (`VOLU`,
 raw `0xKKAABB`. Fields of a travel entry: `actuation`, `trigger` (`normal`,
 `rapid`, `continuous`), `press`, `release`, `upper_deadzone`, `lower_deadzone`.
 
-Writes are deliberately narrow. `apply` writes only key actions, travel
-records and macro regions (a changed mode's region is re-laid out the way NuPhy
-IO lays it out, and only the 56-byte windows that differ are sent), refuses DKS, Mod-Tap, Toggle and Snap Tap keys (assign or remove those
-in NuPhy IO), never assigns factory reset or the firmware loader (not even from a backup), only
-talks to the Air60 HE (`19f5:fee0`, the one layout it knows), and sends no
-command outside the read and write commands it needs. Before writing it saves
-the matrix, travel tables and macros to `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`,
-and afterwards reads them back and fails unless they match.
+Writes are deliberately narrow:
+
+- Only key actions, travel records and macro regions are written, and only the
+  entries that differ (a changed mode's macros are re-laid out the way NuPhy IO
+  lays them out). The G-key bytes past the 128 matrix slots are never written.
+- DKS, Mod-Tap, Toggle and Snap Tap keys are refused; assign or remove those in
+  NuPhy IO.
+- Factory reset and the firmware loader are never put on a key, not even from a
+  backup, and no command outside the region reads and writes is ever sent.
+- Only the Air60 HE (`19f5:fee0`) is talked to: it is the one layout known.
+- Before writing, the matrix, travel tables and macros are saved to
+  `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`; afterwards they are read back and
+  the command fails unless they match.
+
+Backups start with a header (format version, vendor and product id, firmware
+version). `restore-backup` refuses a backup of another board and notes a
+firmware difference. It restores byte for byte wherever the tool writes, even a
+macro region a broken write left undecodable.
 
 ## Device selection
 

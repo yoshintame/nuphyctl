@@ -488,15 +488,15 @@ pub enum HeSubcommand {
     /// Print key actions per mode and layer
     Dump(HeDumpArgs),
     /// Print per-key travel: actuation point, Rapid Trigger, dead zones (mm)
-    Travel(HeTravelArgs),
-    /// Print changed actions and the travel table as an `apply` TOML file
+    Travel(HeReadArgs),
+    /// Print changed actions, macros and the travel table as an `apply` TOML file
     Export(HeExportArgs),
     /// Validate a TOML file without a keyboard
     Check(HeCheckArgs),
     /// Apply a declarative TOML file (only listed keys and fields are touched)
-    Apply(HeApplyArgs),
+    Apply(HeWriteArgs),
     /// Write an `he` backup back to the keyboard (only differing entries)
-    RestoreBackup(HeRestoreBackupArgs),
+    RestoreBackup(HeWriteArgs),
 }
 
 #[derive(Args, Debug)]
@@ -509,15 +509,16 @@ pub struct HeInfoArgs {
     pub device: DeviceSelector,
 }
 
-#[derive(Args, Debug)]
-pub struct HeDumpArgs {
-    /// Only this mode (m1, m2 or m3)
-    #[arg(long)]
-    pub mode: Option<String>,
+/// A mode as NuPhy IO labels it: m1, m2 or m3 (0-based inside).
+fn parse_he_mode(input: &str) -> Result<u8, String> {
+    crate::he::layout::parse_mode(input).map_err(|e| e.to_string())
+}
 
-    /// Only keys that differ from the factory matrix
-    #[arg(long)]
-    pub changed: bool,
+#[derive(Args, Debug)]
+pub struct HeReadArgs {
+    /// Only this mode (m1, m2 or m3)
+    #[arg(long, value_parser = parse_he_mode)]
+    pub mode: Option<u8>,
 
     /// Print JSON
     #[arg(long)]
@@ -528,24 +529,20 @@ pub struct HeDumpArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct HeTravelArgs {
-    /// Only this mode (m1, m2 or m3)
-    #[arg(long)]
-    pub mode: Option<String>,
-
-    /// Print JSON
-    #[arg(long)]
-    pub json: bool,
-
+pub struct HeDumpArgs {
     #[command(flatten)]
-    pub device: DeviceSelector,
+    pub read: HeReadArgs,
+
+    /// Only keys that differ from the factory matrix
+    #[arg(long)]
+    pub changed: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct HeExportArgs {
     /// Only this mode (m1, m2 or m3)
-    #[arg(long)]
-    pub mode: Option<String>,
+    #[arg(long, value_parser = parse_he_mode)]
+    pub mode: Option<u8>,
 
     #[command(flatten)]
     pub device: DeviceSelector,
@@ -557,26 +554,10 @@ pub struct HeCheckArgs {
     pub file: PathBuf,
 }
 
+/// Arguments of the commands that write: `apply` and `restore-backup`.
 #[derive(Args, Debug)]
-pub struct HeApplyArgs {
-    /// TOML file to apply
-    pub file: PathBuf,
-
-    /// Show the changes without writing
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Print JSON
-    #[arg(long)]
-    pub json: bool,
-
-    #[command(flatten)]
-    pub device: DeviceSelector,
-}
-
-#[derive(Args, Debug)]
-pub struct HeRestoreBackupArgs {
-    /// Backup file written by `he apply` (he-*.bin)
+pub struct HeWriteArgs {
+    /// TOML config (`apply`) or backup file (`restore-backup`)
     pub file: PathBuf,
 
     /// Show the changes without writing

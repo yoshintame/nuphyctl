@@ -3,6 +3,12 @@
 
 pub mod actions;
 pub mod cmd;
+pub mod config;
+pub mod layout;
 pub mod macros;
-pub mod model;
+pub mod names;
+pub mod plan;
 pub mod protocol;
+pub mod region;
+pub mod snapshot;
+pub mod travel;

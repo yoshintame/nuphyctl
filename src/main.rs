@@ -1,4 +1,5 @@
 mod app;
+mod backup;
 mod cli;
 mod color;
 mod he;

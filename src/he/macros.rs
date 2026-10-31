@@ -10,27 +10,25 @@
 //! NuPhy IO lays macros out one after another from byte 64 and points unused
 //! entries at an empty step; [`encode_region`] does the same.
 
-use crate::keycodes::{KeycodeGroup, lookup_code, lookup_name};
+use crate::he::names::{Key, call_args, modifier_name, parse_byte, parse_key, usage_name};
+pub use crate::he::region::{MACRO_BYTES, MACRO_COUNT};
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-pub use crate::he::protocol::{MACRO_BYTES, MACRO_COUNT};
 const HEADER: usize = MACRO_COUNT * 2;
 const STEP: usize = 4;
 
 const KIND_MODIFIER: u8 = 1;
 const KIND_KEY: u8 = 2;
 const KIND_MOUSE: u8 = 3;
+/// The flags byte keeps the step kind in its low 6 bits.
+const KIND_MASK: u8 = 0x3f;
 const DOWN: u8 = 0x40;
 const LAST: u8 = 0x80;
 
 /// The delay NuPhy IO puts after each step of a macro it creates, except the
 /// last; `"LCTL+C"` shorthand compiles to it.
 const CHORD_DELAY: u16 = 1;
-
-const MODIFIERS: [&str; 8] = [
-    "LCTL", "LSFT", "LALT", "LGUI", "RCTL", "RSFT", "RALT", "RGUI",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Step {
@@ -44,23 +42,26 @@ pub struct Step {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Macro(pub Vec<Step>);
 
-fn hid_name(code: u8) -> Option<&'static str> {
-    lookup_code(u16::from(code))
-        .filter(|k| matches!(k.group, KeycodeGroup::Basic))
-        .map(|k| k.name)
+impl Step {
+    /// What the step presses: `LCTL`, `C`, `MOUSE(1)` or raw `CODE(kind,code)`.
+    pub fn target_name(&self) -> String {
+        match (self.kind, self.code) {
+            (KIND_MODIFIER, mask) if mask.count_ones() == 1 => {
+                modifier_name(mask.trailing_zeros()).to_string()
+            }
+            (KIND_KEY, usage) if usage_name(usage).is_some() => {
+                usage_name(usage).unwrap_or_default().to_string()
+            }
+            (KIND_MOUSE, button) => format!("MOUSE({button})"),
+            (kind, code) => format!("CODE({kind},{code})"),
+        }
+    }
 }
 
 impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let target = match self.kind {
-            KIND_MODIFIER if self.code.count_ones() == 1 => {
-                MODIFIERS[self.code.trailing_zeros() as usize].to_string()
-            }
-            KIND_KEY if hid_name(self.code).is_some() => hid_name(self.code).unwrap().to_string(),
-            KIND_MOUSE => format!("MOUSE({})", self.code),
-            kind => format!("CODE({kind},{})", self.code),
-        };
-        write!(f, "{target} {}", if self.down { "down" } else { "up" })?;
+        let direction = if self.down { "down" } else { "up" };
+        write!(f, "{} {direction}", self.target_name())?;
         if self.delay != 0 {
             write!(f, " {}", self.delay)?;
         }
@@ -68,52 +69,24 @@ impl fmt::Display for Step {
     }
 }
 
-fn parse_args<'a>(input: &'a str, name: &str) -> Option<&'a str> {
-    let rest = input
-        .get(..name.len())?
-        .eq_ignore_ascii_case(name)
-        .then(|| &input[name.len()..])?;
-    rest.strip_prefix('(')?.strip_suffix(')').map(str::trim)
-}
-
-fn parse_u8(input: &str) -> Result<u8> {
-    let s = input.trim();
-    match s.strip_prefix("0x") {
-        Some(hex) => u8::from_str_radix(hex, 16),
-        None => s.parse(),
-    }
-    .with_context(|| format!("invalid byte {s:?}"))
-}
-
 fn parse_target(input: &str) -> Result<(u8, u8)> {
-    if let Some(args) = parse_args(input, "CODE") {
+    if let Some(args) = call_args(input, "CODE") {
         let (kind, code) = args
             .split_once(',')
             .with_context(|| format!("{input:?}: expected CODE(kind,code)"))?;
-        let kind = parse_u8(kind)?;
-        if !(1..=0x3f).contains(&kind) {
-            bail!("{input:?}: a step kind is 1..=63 (the flags byte keeps 6 bits for it)");
+        let kind = parse_byte(kind)?;
+        if !(1..=KIND_MASK).contains(&kind) {
+            bail!("{input:?}: a step kind is 1..={KIND_MASK}");
         }
-        return Ok((kind, parse_u8(code)?));
+        return Ok((kind, parse_byte(code)?));
     }
-    if let Some(args) = parse_args(input, "MOUSE") {
-        return Ok((KIND_MOUSE, parse_u8(args)?));
+    if let Some(args) = call_args(input, "MOUSE") {
+        return Ok((KIND_MOUSE, parse_byte(args)?));
     }
-    let upper = input.to_ascii_uppercase();
-    let upper = upper.strip_prefix("KC_").unwrap_or(&upper);
-    if let Some(i) = MODIFIERS.iter().position(|m| *m == upper) {
-        return Ok((KIND_MODIFIER, 1 << i));
-    }
-    let k = lookup_name(upper)
-        .filter(|k| k.code <= 0xff)
-        .with_context(|| format!("unknown key {input:?}"))?;
-    if (0xe0..=0xe7).contains(&k.code) {
-        return Ok((KIND_MODIFIER, 1 << (k.code - 0xe0)));
-    }
-    if !matches!(k.group, KeycodeGroup::Basic) {
-        bail!("{input:?} is not a key a macro can press");
-    }
-    Ok((KIND_KEY, k.code as u8))
+    Ok(match parse_key(input)? {
+        Key::Modifier(bit) => (KIND_MODIFIER, bit),
+        Key::Usage(usage) => (KIND_KEY, usage),
+    })
 }
 
 impl std::str::FromStr for Step {
@@ -154,8 +127,8 @@ impl Macro {
     pub fn chord(input: &str) -> Result<Self> {
         let mut mods = Vec::new();
         let mut key = None;
-        for part in input.split('+').map(str::trim) {
-            match parse_target(part).with_context(|| format!("in {input:?}"))? {
+        for part in input.split('+') {
+            match parse_target(part.trim()).with_context(|| format!("in {input:?}"))? {
                 (KIND_MODIFIER, bit) => mods.push(bit),
                 (KIND_KEY, code) if key.is_none() => key = Some(code),
                 _ => bail!("{input:?}: a chord is modifiers and at most one key"),
@@ -182,17 +155,13 @@ impl Macro {
     /// The shortest config value that reproduces this macro exactly.
     pub fn to_toml(&self) -> String {
         if !self.0.is_empty() {
-            let mut names = Vec::new();
-            for s in self.0.iter().filter(|s| s.down) {
-                names.push(
-                    s.to_string()
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_string(),
-                );
-            }
-            let shorthand = names.join("+");
+            let pressed: Vec<String> = self
+                .0
+                .iter()
+                .filter(|s| s.down)
+                .map(Step::target_name)
+                .collect();
+            let shorthand = pressed.join("+");
             if Self::chord(&shorthand).is_ok_and(|m| m == *self) {
                 return format!("\"{shorthand}\"");
             }
@@ -222,7 +191,7 @@ impl Macro {
 }
 
 fn step_bytes(s: &Step, last: bool) -> [u8; STEP] {
-    let flags = (s.kind & 0x3f) | if s.down { DOWN } else { 0 } | if last { LAST } else { 0 };
+    let flags = (s.kind & KIND_MASK) | if s.down { DOWN } else { 0 } | if last { LAST } else { 0 };
     [s.delay as u8, (s.delay >> 8) as u8, flags, s.code]
 }
 
@@ -251,7 +220,7 @@ pub fn decode_region(region: &[u8]) -> Result<Vec<Macro>> {
             }
             let b = &region[at..at + STEP];
             steps.push(Step {
-                kind: b[2] & 0x3f,
+                kind: b[2] & KIND_MASK,
                 down: b[2] & DOWN != 0,
                 code: b[3],
                 delay: u16::from(b[0]) | u16::from(b[1]) << 8,

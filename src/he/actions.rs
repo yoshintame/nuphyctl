@@ -9,63 +9,101 @@
 //! - Anything else (DKS, Toggle, Mod-Tap, Snap Tap, mouse, ...) is shown and
 //!   accepted as raw hex `0xKKAABB`.
 
-use crate::he::protocol::{LAYERS, MACRO_COUNT};
-use crate::keycodes::{KeycodeGroup, lookup_code, lookup_name};
+use crate::he::names::{Key, call_args, modifier_names, parse_key, parse_number, usage_name};
+use crate::he::region::{LAYERS, MACRO_COUNT};
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-pub const KIND_KEY: u8 = 0x10;
-pub const KIND_CONSUMER: u8 = 0x30;
-pub const KIND_MACRO: u8 = 0x70;
-pub const KIND_FUNCTION: u8 = 0xf0;
+const KIND_KEY: u8 = 0x10;
+const KIND_CONSUMER: u8 = 0x30;
+const KIND_MACRO: u8 = 0x70;
+const KIND_FUNCTION: u8 = 0xf0;
 const FN_LAYER: u8 = 0xff;
-const FIRMWARE_LOADER: u8 = 0x07;
-const FACTORY_RESET: u8 = 0x08;
+const MACRO_TAIL: u8 = 0xff;
 
+/// The three bytes of a matrix slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Action(pub [u8; 3]);
 
-impl Action {
-    pub const NONE: Self = Self([KIND_KEY, 0, 0]);
-
-    /// Actions this tool may write: their meaning lives in these three bytes
-    /// (a macro slot only points at the macro). DKS, Mod-Tap, Toggle and Snap
-    /// Tap keys point into tables this tool does not edit, and factory reset
-    /// or the firmware loader are never assigned.
-    pub fn is_writable(self) -> bool {
-        match self.0 {
-            [KIND_KEY | KIND_CONSUMER, ..] => true,
-            [KIND_MACRO, slot, 0xff] => usize::from(slot) < MACRO_COUNT,
-            [KIND_FUNCTION, FN_LAYER, layer] => layer < LAYERS,
-            [KIND_FUNCTION, f, 0] => FUNCTIONS.iter().any(|x| x.0 == f && x.2),
-            _ => false,
-        }
-    }
-
-    /// The absolute layer of a momentary-layer action.
-    pub fn layer(self) -> Option<u8> {
-        match self.0 {
-            [KIND_FUNCTION, FN_LAYER, layer] if layer < LAYERS => Some(layer),
-            _ => None,
-        }
-    }
-
-    /// Never written to the keyboard by any command, `restore-backup`
-    /// included: the firmware loader and factory reset.
-    pub fn is_forbidden(self) -> bool {
-        matches!(self.0, [KIND_FUNCTION, FIRMWARE_LOADER | FACTORY_RESET, _])
-    }
+/// What an action means, decoded once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    None,
+    Key {
+        mods: u8,
+        usage: u8,
+    },
+    Consumer(u16),
+    /// A macro slot, 0-based.
+    Macro(u8),
+    /// A momentary layer, absolute (0..=11).
+    Layer(u8),
+    Function(&'static Function),
+    /// Anything without a meaning of its own here: DKS, Toggle, Mod-Tap,
+    /// Snap Tap, mouse, unknown functions or out-of-range slots.
+    Raw([u8; 3]),
 }
 
-const MODIFIERS: &[(u8, &str)] = &[
-    (0x01, "LCTL"),
-    (0x02, "LSFT"),
-    (0x04, "LALT"),
-    (0x08, "LGUI"),
-    (0x10, "RCTL"),
-    (0x20, "RSFT"),
-    (0x40, "RALT"),
-    (0x80, "RGUI"),
+/// A keyboard function (`f0 code 00`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Function {
+    pub code: u8,
+    pub name: &'static str,
+    /// Whether `apply` may put it on a key.
+    pub assignable: bool,
+}
+
+const FIRMWARE_LOADER: u8 = 0x07;
+const FACTORY_RESET: u8 = 0x08;
+
+macro_rules! f {
+    ($code:expr, $name:expr, $assignable:expr) => {
+        Function {
+            code: $code,
+            name: $name,
+            assignable: $assignable,
+        }
+    };
+}
+
+static FUNCTIONS: &[Function] = &[
+    f!(0x01, "KBD_LOCK", true),
+    f!(0x02, "WIN_LOCK", true),
+    f!(0x04, "WIN_MODE", false),
+    f!(0x05, "MAC_MODE", false),
+    f!(0x06, "WIN_MAC", false),
+    f!(FIRMWARE_LOADER, "FIRMWARE_LOADER", false),
+    f!(FACTORY_RESET, "FACTORY_RESET", false),
+    f!(0x10, "SIDE_BRIGHTER", true),
+    f!(0x11, "SIDE_DIMMER", true),
+    f!(0x12, "SIDE_SLOWER", false),
+    f!(0x13, "SIDE_FASTER", false),
+    f!(0x15, "SIDE_COLOR", true),
+    f!(0x16, "SIDE_EFFECT", true),
+    f!(0x2e, "LIGHT_NEXT", true),
+    f!(0x2f, "LIGHT_PREV", true),
+    f!(0x30, "LIGHT_TOGGLE", true),
+    f!(0x32, "LIGHT_BRIGHTER", true),
+    f!(0x33, "LIGHT_DIMMER", true),
+    f!(0x34, "LIGHT_LOOP", false),
+    f!(0x35, "LIGHT_OFF", false),
+    f!(0x36, "LIGHT_FASTER", true),
+    f!(0x37, "LIGHT_SLOWER", true),
+    f!(0x39, "LIGHT_LEFT", false),
+    f!(0x3a, "LIGHT_RIGHT", false),
+    f!(0x3c, "COLOR_NEXT", true),
+    f!(0x3d, "COLOR_PREV", true),
+    f!(0x3e, "COLOR_LOOP", true),
+    f!(0x51, "MAC_SEARCH", false),
+    f!(0x52, "SLEEP", true),
+    f!(0x53, "SCREENSHOT_AREA", true),
+    f!(0x54, "SCREENSHOT", true),
+    f!(0x55, "MAC_SCREENSHOT_AREA", false),
+    f!(0x56, "MAC_SCREENSHOT", false),
+    f!(0xfa, "MODE1", true),
+    f!(0xfb, "MODE2", true),
+    f!(0xfc, "MODE3", true),
+    f!(0xfe, "LAYER_SWITCH", false),
 ];
 
 /// Consumer usages offered by NuPhy IO.
@@ -93,107 +131,141 @@ const CONSUMER: &[(u16, &str)] = &[
     (0x00cf, "SIRI"),
 ];
 
-/// Keyboard functions (`f0 f 00`): code, name, safe to assign. Factory reset
-/// and the firmware loader are never assigned by this tool.
-const FUNCTIONS: &[(u8, &str, bool)] = &[
-    (0x01, "KBD_LOCK", true),
-    (0x02, "WIN_LOCK", true),
-    (0x04, "WIN_MODE", false),
-    (0x05, "MAC_MODE", false),
-    (0x06, "WIN_MAC", false),
-    (0x07, "FIRMWARE_LOADER", false),
-    (0x08, "FACTORY_RESET", false),
-    (0x10, "SIDE_BRIGHTER", true),
-    (0x11, "SIDE_DIMMER", true),
-    (0x12, "SIDE_SLOWER", false),
-    (0x13, "SIDE_FASTER", false),
-    (0x15, "SIDE_COLOR", true),
-    (0x16, "SIDE_EFFECT", true),
-    (0x2e, "LIGHT_NEXT", true),
-    (0x2f, "LIGHT_PREV", true),
-    (0x30, "LIGHT_TOGGLE", true),
-    (0x32, "LIGHT_BRIGHTER", true),
-    (0x33, "LIGHT_DIMMER", true),
-    (0x34, "LIGHT_LOOP", false),
-    (0x35, "LIGHT_OFF", false),
-    (0x36, "LIGHT_FASTER", true),
-    (0x37, "LIGHT_SLOWER", true),
-    (0x39, "LIGHT_LEFT", false),
-    (0x3a, "LIGHT_RIGHT", false),
-    (0x3c, "COLOR_NEXT", true),
-    (0x3d, "COLOR_PREV", true),
-    (0x3e, "COLOR_LOOP", true),
-    (0x51, "MAC_SEARCH", false),
-    (0x52, "SLEEP", true),
-    (0x53, "SCREENSHOT_AREA", true),
-    (0x54, "SCREENSHOT", true),
-    (0x55, "MAC_SCREENSHOT_AREA", false),
-    (0x56, "MAC_SCREENSHOT", false),
-    (0xfa, "MODE1", true),
-    (0xfb, "MODE2", true),
-    (0xfc, "MODE3", true),
-    (0xfe, "LAYER_SWITCH", false),
-];
+impl Action {
+    pub const NONE: Self = Self([KIND_KEY, 0, 0]);
 
-fn hid_name(hid: u8) -> Option<&'static str> {
-    lookup_code(u16::from(hid))
-        .filter(|k| matches!(k.group, KeycodeGroup::Basic))
-        .map(|k| k.name)
-}
-
-impl fmt::Display for Action {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [kind, a, b] = self.0;
-        match kind {
-            KIND_KEY if a == 0 && b == 0 => f.write_str("NO"),
-            KIND_KEY if b == 0 || hid_name(b).is_some() => {
-                let mut parts: Vec<&str> = MODIFIERS
-                    .iter()
-                    .filter(|(bit, _)| a & bit != 0)
-                    .map(|(_, n)| *n)
-                    .collect();
-                if let Some(name) = hid_name(b) {
-                    parts.push(name);
-                }
-                f.write_str(&parts.join("+"))
+    pub fn kind(self) -> ActionKind {
+        match self.0 {
+            [KIND_KEY, 0, 0] => ActionKind::None,
+            [KIND_KEY, mods, usage] if usage == 0 || usage_name(usage).is_some() => {
+                ActionKind::Key { mods, usage }
             }
-            KIND_CONSUMER => {
-                let usage = u16::from(a) | (u16::from(b) << 8);
-                match CONSUMER.iter().find(|(u, _)| *u == usage) {
-                    Some((_, name)) => f.write_str(name),
-                    None => write!(f, "CONSUMER(0x{usage:03x})"),
-                }
+            [KIND_CONSUMER, lo, hi] => ActionKind::Consumer(u16::from_le_bytes([lo, hi])),
+            [KIND_MACRO, slot, MACRO_TAIL] if usize::from(slot) < MACRO_COUNT => {
+                ActionKind::Macro(slot)
             }
-            KIND_MACRO if b == 0xff && usize::from(a) < MACRO_COUNT => {
-                write!(f, "MACRO({})", u16::from(a) + 1)
-            }
-            KIND_FUNCTION if a == FN_LAYER && b < LAYERS => write!(f, "FN({b})"),
-            KIND_FUNCTION if b == 0 => match FUNCTIONS.iter().find(|x| x.0 == a) {
-                Some((_, name, _)) => f.write_str(name),
-                None => write!(f, "0x{kind:02x}{a:02x}{b:02x}"),
+            [KIND_FUNCTION, FN_LAYER, layer] if layer < LAYERS => ActionKind::Layer(layer),
+            [KIND_FUNCTION, code, 0] => match FUNCTIONS.iter().find(|f| f.code == code) {
+                Some(f) => ActionKind::Function(f),
+                None => ActionKind::Raw(self.0),
             },
-            _ => write!(f, "0x{kind:02x}{a:02x}{b:02x}"),
+            bytes => ActionKind::Raw(bytes),
+        }
+    }
+
+    /// Actions `apply` may write: their meaning lives in these three bytes
+    /// (a macro slot only points at the macro). DKS, Mod-Tap, Toggle and Snap
+    /// Tap keys point into tables this tool does not edit.
+    pub fn is_writable(self) -> bool {
+        match self.kind() {
+            ActionKind::Function(f) => f.assignable,
+            ActionKind::Raw(_) => false,
+            _ => true,
+        }
+    }
+
+    /// Never written to the keyboard by any command, `restore-backup`
+    /// included: the firmware loader and factory reset, whatever the third
+    /// byte holds.
+    pub fn is_forbidden(self) -> bool {
+        matches!(self.0, [KIND_FUNCTION, FIRMWARE_LOADER | FACTORY_RESET, _])
+    }
+
+    /// The absolute layer of a momentary-layer action.
+    pub fn layer(self) -> Option<u8> {
+        match self.kind() {
+            ActionKind::Layer(layer) => Some(layer),
+            _ => None,
         }
     }
 }
 
-fn call<'a>(input: &'a str, name: &str) -> Option<&'a str> {
-    let rest = input
-        .get(..name.len())?
-        .eq_ignore_ascii_case(name)
-        .then(|| &input[name.len()..])?;
-    rest.strip_prefix('(')?.strip_suffix(')').map(str::trim)
+impl From<ActionKind> for Action {
+    fn from(kind: ActionKind) -> Self {
+        Self(match kind {
+            ActionKind::None => [KIND_KEY, 0, 0],
+            ActionKind::Key { mods, usage } => [KIND_KEY, mods, usage],
+            ActionKind::Consumer(usage) => {
+                let [lo, hi] = usage.to_le_bytes();
+                [KIND_CONSUMER, lo, hi]
+            }
+            ActionKind::Macro(slot) => [KIND_MACRO, slot, MACRO_TAIL],
+            ActionKind::Layer(layer) => [KIND_FUNCTION, FN_LAYER, layer],
+            ActionKind::Function(f) => [KIND_FUNCTION, f.code, 0],
+            ActionKind::Raw(bytes) => bytes,
+        })
+    }
 }
 
-fn parse_number(input: &str) -> Result<u32> {
-    let parsed = match input
-        .strip_prefix("0x")
-        .or_else(|| input.strip_prefix("0X"))
-    {
-        Some(hex) => u32::from_str_radix(hex, 16),
-        None => input.parse(),
-    };
-    parsed.with_context(|| format!("invalid number {input:?}"))
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind() {
+            ActionKind::None => f.write_str("NO"),
+            ActionKind::Key { mods, usage } => {
+                let names: Vec<&str> = modifier_names(mods).chain(usage_name(usage)).collect();
+                f.write_str(&names.join("+"))
+            }
+            ActionKind::Consumer(usage) => match CONSUMER.iter().find(|(u, _)| *u == usage) {
+                Some((_, name)) => f.write_str(name),
+                None => write!(f, "CONSUMER(0x{usage:03x})"),
+            },
+            ActionKind::Macro(slot) => write!(f, "MACRO({})", u16::from(slot) + 1),
+            ActionKind::Layer(layer) => write!(f, "FN({layer})"),
+            ActionKind::Function(func) => f.write_str(func.name),
+            ActionKind::Raw([k, a, b]) => write!(f, "0x{k:02x}{a:02x}{b:02x}"),
+        }
+    }
+}
+
+fn parse_kind(s: &str) -> Result<ActionKind> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if hex.len() != 6 {
+            bail!("raw action {s:?} must be 6 hex digits, like 0x10002c");
+        }
+        let v =
+            u32::from_str_radix(hex, 16).with_context(|| format!("invalid raw action {s:?}"))?;
+        return Ok(Action([(v >> 16) as u8, (v >> 8) as u8, v as u8]).kind());
+    }
+    if let Some(n) = call_args(s, "FN") {
+        let layer = parse_number(n)?;
+        if layer >= u32::from(LAYERS) {
+            bail!("layer {layer} out of range in {s:?} (0..=11)");
+        }
+        return Ok(ActionKind::Layer(layer as u8));
+    }
+    if let Some(n) = call_args(s, "MACRO") {
+        let number = parse_number(n)?;
+        if !(1..=MACRO_COUNT as u32).contains(&number) {
+            bail!("macro number out of range in {s:?} (1..={MACRO_COUNT})");
+        }
+        return Ok(ActionKind::Macro((number - 1) as u8));
+    }
+    if let Some(n) = call_args(s, "CONSUMER") {
+        let usage = u16::try_from(parse_number(n)?)
+            .ok()
+            .with_context(|| format!("consumer usage out of range in {s:?}"))?;
+        return Ok(ActionKind::Consumer(usage));
+    }
+    let upper = s.to_ascii_uppercase();
+    if matches!(upper.as_str(), "NO" | "NONE" | "XXXXXXX") {
+        return Ok(ActionKind::None);
+    }
+    if let Some((usage, _)) = CONSUMER.iter().find(|(_, n)| *n == upper) {
+        return Ok(ActionKind::Consumer(*usage));
+    }
+    if let Some(func) = FUNCTIONS.iter().find(|f| f.name == upper) {
+        return Ok(ActionKind::Function(func));
+    }
+    let mut mods = 0u8;
+    let mut usage = 0u8;
+    for part in s.split('+') {
+        match parse_key(part).with_context(|| format!("in {s:?}"))? {
+            Key::Modifier(bit) => mods |= bit,
+            Key::Usage(_) if usage != 0 => bail!("{s:?}: at most one key besides modifiers"),
+            Key::Usage(u) => usage = u,
+        }
+    }
+    Ok(ActionKind::Key { mods, usage })
 }
 
 impl std::str::FromStr for Action {
@@ -201,69 +273,10 @@ impl std::str::FromStr for Action {
 
     fn from_str(input: &str) -> Result<Self> {
         let s = input.trim();
-        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            if hex.len() != 6 {
-                bail!("raw action {s:?} must be 6 hex digits, like 0x10002c");
-            }
-            let v = u32::from_str_radix(hex, 16)
-                .with_context(|| format!("invalid raw action {s:?}"))?;
-            return Ok(Self([(v >> 16) as u8, (v >> 8) as u8, v as u8]));
+        if s.is_empty() {
+            bail!("empty action");
         }
-        if let Some(n) = call(s, "FN") {
-            let layer = parse_number(n)?;
-            if layer >= u32::from(LAYERS) {
-                bail!("layer {layer} out of range in {s:?} (0..=11)");
-            }
-            return Ok(Self([KIND_FUNCTION, FN_LAYER, layer as u8]));
-        }
-        if let Some(n) = call(s, "MACRO") {
-            let number = parse_number(n)?;
-            if !(1..=MACRO_COUNT as u32).contains(&number) {
-                bail!("macro number out of range in {s:?} (1..={MACRO_COUNT})");
-            }
-            return Ok(Self([KIND_MACRO, (number - 1) as u8, 0xff]));
-        }
-        if let Some(n) = call(s, "CONSUMER") {
-            let usage = u16::try_from(parse_number(n)?)
-                .ok()
-                .with_context(|| format!("consumer usage out of range in {s:?}"))?;
-            return Ok(Self([KIND_CONSUMER, usage as u8, (usage >> 8) as u8]));
-        }
-        let upper = s.to_ascii_uppercase();
-        if matches!(upper.as_str(), "NO" | "NONE" | "XXXXXXX") {
-            return Ok(Self::NONE);
-        }
-        if let Some((usage, _)) = CONSUMER.iter().find(|(_, n)| *n == upper) {
-            return Ok(Self([KIND_CONSUMER, *usage as u8, (*usage >> 8) as u8]));
-        }
-        if let Some((f, _, _)) = FUNCTIONS.iter().find(|x| x.1 == upper) {
-            return Ok(Self([KIND_FUNCTION, *f, 0]));
-        }
-
-        let mut mods = 0u8;
-        let mut hid = 0u8;
-        for part in upper.split('+').map(str::trim) {
-            let part = part.strip_prefix("KC_").unwrap_or(part);
-            if let Some((bit, _)) = MODIFIERS.iter().find(|(_, n)| *n == part) {
-                mods |= bit;
-                continue;
-            }
-            let k = lookup_name(part)
-                .filter(|k| k.code <= 0xff)
-                .with_context(|| format!("unknown key {part:?} in {s:?}"))?;
-            if (0xe0..=0xe7).contains(&k.code) {
-                mods |= 1 << (k.code - 0xe0);
-                continue;
-            }
-            if !matches!(k.group, KeycodeGroup::Basic) || hid != 0 {
-                bail!("{s:?}: at most one key besides modifiers");
-            }
-            hid = k.code as u8;
-        }
-        if mods == 0 && hid == 0 {
-            bail!("empty action {s:?}");
-        }
-        Ok(Self([KIND_KEY, mods, hid]))
+        Ok(parse_kind(s)?.into())
     }
 }
 
@@ -301,15 +314,21 @@ mod tests {
         assert_eq!("VOLU".parse::<Action>().unwrap(), a([0x30, 0xe9, 0]));
         assert_eq!("FN(9)".parse::<Action>().unwrap(), a([0xf0, 0xff, 9]));
         assert_eq!("macro(1)".parse::<Action>().unwrap(), a([0x70, 0, 0xff]));
-        assert!("MACRO(0)".parse::<Action>().is_err());
-        assert!("MACRO(33)".parse::<Action>().is_err());
         assert_eq!("MACRO(32)".parse::<Action>().unwrap(), a([0x70, 31, 0xff]));
         assert_eq!("0x950020".parse::<Action>().unwrap(), a([0x95, 0, 0x20]));
         assert_eq!("NO".parse::<Action>().unwrap(), Action::NONE);
-        assert!("FN(12)".parse::<Action>().is_err());
-        assert!("A+B".parse::<Action>().is_err());
-        assert!("NOPE".parse::<Action>().is_err());
-        assert!("0x1234".parse::<Action>().is_err());
+        for bad in [
+            "FN(12)",
+            "A+B",
+            "NOPE",
+            "0x1234",
+            "MACRO(0)",
+            "MACRO(33)",
+            "",
+            "VOLU+A",
+        ] {
+            assert!(bad.parse::<Action>().is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -328,6 +347,7 @@ mod tests {
             [0xf0, 0xff, 12],
             [0x70, 0xff, 0xff],
             [0x70, 32, 0xff],
+            [0xf0, 0x52, 7],
         ] {
             let action = a(bytes);
             assert_eq!(
@@ -339,20 +359,30 @@ mod tests {
     }
 
     #[test]
-    fn writable_kinds() {
-        assert!(a([0x10, 0, 4]).is_writable());
-        assert!(a([0x30, 0xe2, 0]).is_writable());
-        assert!(a([0xf0, 0xff, 3]).is_writable());
-        assert!(a([0xf0, 0x52, 0]).is_writable());
-        assert!(a([0x70, 0, 0xff]).is_writable());
-        assert!(!a([0xf0, 0xff, 12]).is_writable());
-        assert!(!a([0xf0, 0x07, 0]).is_writable());
-        assert!(!a([0xf0, 0x08, 0]).is_writable());
-        assert!(!a([0x95, 0, 0x20]).is_writable());
-        assert!(!a([0x70, 32, 0xff]).is_writable());
-        assert!(!a([0xf0, 0x52, 7]).is_writable());
+    fn writable_and_forbidden() {
+        for w in [
+            [0x10, 0, 4],
+            [0x30, 0xe2, 0],
+            [0xf0, 0xff, 3],
+            [0xf0, 0x52, 0],
+            [0x70, 0, 0xff],
+        ] {
+            assert!(a(w).is_writable(), "{w:02x?}");
+        }
+        for nw in [
+            [0xf0, 0xff, 12],
+            [0xf0, 0x07, 0],
+            [0xf0, 0x08, 0],
+            [0x95, 0, 0x20],
+            [0x70, 32, 0xff],
+            [0xf0, 0x52, 7],
+        ] {
+            assert!(!a(nw).is_writable(), "{nw:02x?}");
+        }
         assert!(a([0xf0, 0x07, 0]).is_forbidden());
-        assert!(a([0xf0, 0x08, 0]).is_forbidden());
+        assert!(a([0xf0, 0x08, 5]).is_forbidden());
         assert!(!a([0xf0, 0x52, 0]).is_forbidden());
+        assert_eq!(a([0xf0, 0xff, 9]).layer(), Some(9));
+        assert_eq!(a([0x10, 0, 4]).layer(), None);
     }
 }

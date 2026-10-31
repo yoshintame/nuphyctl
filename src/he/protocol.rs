@@ -11,70 +11,77 @@
 //! reply:   aa cmd key sum len addr_lo addr_hi 00 data^key...
 //! ```
 
+use crate::he::region::{CHUNK, LAYERS_PER_MODE, MODES, Region, WriteChunk};
 use crate::hid_transport::{HidResponder, REPORT_LEN, Report};
 use anyhow::{Context, Result, bail};
 use hidapi::HidDevice;
+use std::fmt;
 use std::time::Duration;
-
-pub const CHUNK: usize = REPORT_LEN - 8;
-
-pub const MODES: u8 = 3;
-pub const LAYERS_PER_MODE: u8 = 4;
-pub const LAYERS: u8 = MODES * LAYERS_PER_MODE;
-pub const MATRIX_SLOTS: usize = 128;
-pub const ACTION_LEN: usize = 3;
-/// One layer: 128 slots of 3 bytes, then 16 G keys from byte 464.
-pub const LAYER_BYTES: usize = 512;
-pub const TRAVEL_RECORD: usize = 8;
-/// One mode's travel table: 128 records of 8 bytes.
-pub const TRAVEL_BYTES: usize = MATRIX_SLOTS * TRAVEL_RECORD;
-/// One mode's macro region: 32 `u16` offsets, then 4-byte steps.
-pub const MACRO_BYTES: usize = 2048;
-pub const MACRO_COUNT: usize = 32;
-const BASE_BYTES: usize = 16;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 const ATTEMPTS: usize = 3;
+const BASE_BYTES: usize = 16;
 
 const FLAG_HOST: u8 = 0x55;
 const FLAG_REPLY: u8 = 0xaa;
 
-pub const CMD_GET_INFO: u8 = 3;
-pub const CMD_GET_BASE: u8 = 4;
-pub const CMD_GET_DEFAULT_MATRIX: u8 = 7;
-pub const CMD_GET_USE_MATRIX: u8 = 8;
-pub const CMD_SET_USE_MATRIX: u8 = 9;
-pub const CMD_GET_MACRO: u8 = 12;
-pub const CMD_SET_MACRO: u8 = 13;
-pub const CMD_GET_TRAVEL: u8 = 160;
-pub const CMD_SET_TRAVEL: u8 = 161;
+const CMD_GET_INFO: u8 = 3;
+const CMD_GET_BASE: u8 = 4;
+const CMD_GET_DEFAULT_MATRIX: u8 = 7;
 
-/// The commands this tool may ever send. Everything else (factory reset,
-/// calibration, mode settings whose byte 0 enters the firmware loader, the
-/// loader itself) is refused before a packet is built.
-const ALLOWED: &[u8] = &[
-    CMD_GET_INFO,
-    CMD_GET_BASE,
-    CMD_GET_DEFAULT_MATRIX,
-    CMD_GET_USE_MATRIX,
-    CMD_SET_USE_MATRIX,
-    CMD_GET_MACRO,
-    CMD_SET_MACRO,
-    CMD_GET_TRAVEL,
-    CMD_SET_TRAVEL,
-];
+/// Commands this tool may ever send: reads, and the writes of the regions in
+/// the memory map. Factory reset, calibration, mode settings (whose byte 0
+/// enters the firmware loader) and the loader itself are refused before a
+/// packet is built.
+fn is_allowed(cmd: u8) -> bool {
+    [CMD_GET_INFO, CMD_GET_BASE, CMD_GET_DEFAULT_MATRIX].contains(&cmd)
+        || Region::ALL
+            .iter()
+            .any(|r| r.get_cmd() == cmd || r.set_cmd() == cmd)
+}
+
+/// Firmware version: two bytes read as hexadecimal digits (`20 01` is 120).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareVersion(pub u16);
+
+impl FirmwareVersion {
+    /// Versions the write path was checked against.
+    const WRITES: std::ops::RangeInclusive<u32> = 110..=139;
+
+    /// The digits as a decimal number, if every one is 0..=9.
+    pub fn number(self) -> Option<u32> {
+        (0..4).rev().try_fold(0u32, |acc, i| {
+            let digit = u32::from((self.0 >> (4 * i)) & 0xf);
+            (digit < 10).then_some(acc * 10 + digit)
+        })
+    }
+
+    pub fn writes_supported(self) -> bool {
+        self.number().is_some_and(|n| Self::WRITES.contains(&n))
+    }
+
+    pub fn check_writes(self) -> Result<()> {
+        if !self.writes_supported() {
+            bail!(
+                "refusing to write: firmware {self} is outside the checked range {}..={}",
+                Self::WRITES.start(),
+                Self::WRITES.end()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for FirmwareVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:x}", self.0)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirmwareInfo {
-    /// Two bytes read as a hexadecimal number, `14 01` -> `114`.
-    pub version: String,
+    pub version: FirmwareVersion,
     pub built: String,
-}
-
-impl FirmwareInfo {
-    pub fn number(&self) -> Option<u32> {
-        self.version.parse().ok()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,11 +114,33 @@ impl<'a> HeProtocol<'a> {
         let data = self
             .read(CMD_GET_BASE, 0, BASE_BYTES)
             .context("GetBase (4) failed")?;
-        parse_base(&data, base_offset(firmware))
+        parse_base(&data, base_offset(firmware.version))
     }
 
-    /// Read `size` bytes of a region starting at `addr`, in packet-sized chunks.
-    pub fn read(&self, cmd: u8, addr: u16, size: usize) -> Result<Vec<u8>> {
+    pub fn read_region(&self, region: Region) -> Result<Vec<u8>> {
+        self.read(region.get_cmd(), 0, region.len())
+            .with_context(|| format!("failed to read the {}", region.name()))
+    }
+
+    pub fn read_factory_matrix(&self) -> Result<Vec<u8>> {
+        self.read(CMD_GET_DEFAULT_MATRIX, 0, Region::Matrix.len())
+            .context("failed to read the factory key matrix")
+    }
+
+    pub fn write(&self, region: Region, chunk: &WriteChunk) -> Result<()> {
+        region.check_write(chunk.addr, &chunk.data)?;
+        self.transact(
+            region.set_cmd(),
+            chunk.addr,
+            chunk.data.len() as u8,
+            &chunk.data,
+        )
+        .with_context(|| format!("{} write at {} failed", region.name(), chunk.addr))?;
+        Ok(())
+    }
+
+    /// Read `size` bytes from `addr`, in packet-sized chunks.
+    fn read(&self, cmd: u8, addr: u16, size: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(size);
         while out.len() < size {
             let n = (size - out.len()).min(CHUNK);
@@ -123,14 +152,6 @@ impl<'a> HeProtocol<'a> {
             out.extend_from_slice(&reply_data(&reply, n));
         }
         Ok(out)
-    }
-
-    /// Write `data` (at most one packet) to a region at `addr`.
-    pub fn write(&self, cmd: u8, addr: u16, data: &[u8]) -> Result<()> {
-        guard_write(cmd, addr, data)?;
-        self.transact(cmd, addr, data.len() as u8, data)
-            .with_context(|| format!("write (cmd {cmd}) at {addr} failed"))?;
-        Ok(())
     }
 
     fn transact(&self, cmd: u8, addr: u16, len: u8, data: &[u8]) -> Result<Report> {
@@ -152,7 +173,7 @@ impl<'a> HeProtocol<'a> {
 }
 
 pub fn build(cmd: u8, addr: u16, len: u8, data: &[u8]) -> Result<Report> {
-    if !ALLOWED.contains(&cmd) {
+    if !is_allowed(cmd) {
         bail!("command {cmd} is not one this tool sends");
     }
     if usize::from(len) > CHUNK || data.len() > CHUNK {
@@ -167,55 +188,6 @@ pub fn build(cmd: u8, addr: u16, len: u8, data: &[u8]) -> Result<Report> {
     p[8..8 + data.len()].copy_from_slice(data);
     p[3] = checksum(&p);
     Ok(p)
-}
-
-fn guard_write(cmd: u8, addr: u16, data: &[u8]) -> Result<()> {
-    if data.is_empty() {
-        bail!("refusing an empty write");
-    }
-    let addr = usize::from(addr);
-    match cmd {
-        CMD_SET_USE_MATRIX => {
-            let within = addr % LAYER_BYTES;
-            if !within.is_multiple_of(ACTION_LEN) || !data.len().is_multiple_of(ACTION_LEN) {
-                bail!("key actions are written whole: 3 bytes from a slot's own address");
-            }
-            if within + data.len() > MATRIX_SLOTS * ACTION_LEN {
-                bail!(
-                    "write reaches past the matrix slots of layer {}",
-                    addr / LAYER_BYTES
-                );
-            }
-            if addr + data.len() > usize::from(LAYERS) * LAYER_BYTES {
-                bail!("write reaches past the last layer");
-            }
-            for action in data.chunks(ACTION_LEN) {
-                let action = crate::he::actions::Action([action[0], action[1], action[2]]);
-                if action.is_forbidden() {
-                    bail!("refusing to assign {action} to a key");
-                }
-            }
-        }
-        CMD_SET_TRAVEL => {
-            if !addr.is_multiple_of(TRAVEL_RECORD) || !data.len().is_multiple_of(TRAVEL_RECORD) {
-                bail!("travel records are written whole: 8 bytes from a record's own address");
-            }
-            if addr + data.len() > usize::from(MODES) * TRAVEL_BYTES {
-                bail!("write reaches past the last mode's travel table");
-            }
-        }
-        CMD_SET_MACRO => {
-            let region = MACRO_BYTES;
-            if addr / region != (addr + data.len() - 1) / region {
-                bail!("a macro write stays within one mode's region");
-            }
-            if addr + data.len() > usize::from(MODES) * region {
-                bail!("write reaches past the last mode's macro region");
-            }
-        }
-        _ => bail!("command {cmd} is not a write this tool makes"),
-    }
-    Ok(())
 }
 
 fn checksum(p: &Report) -> u8 {
@@ -252,19 +224,19 @@ fn parse_info(r: &Report) -> FirmwareInfo {
     if d[..3].iter().all(u8::is_ascii_alphabetic) {
         // Old firmware answers with the build text alone.
         return FirmwareInfo {
-            version: "100".into(),
+            version: FirmwareVersion(0x100),
             built: text(&d),
         };
     }
     FirmwareInfo {
-        version: format!("{:x}", u16::from(d[1]) << 8 | u16::from(d[0])),
+        version: FirmwareVersion(u16::from(d[1]) << 8 | u16::from(d[0])),
         built: text(&d[2..]),
     }
 }
 
 /// Firmware 100..=109 keeps the mode byte of `GetBase` 8 bytes further in.
-fn base_offset(firmware: &FirmwareInfo) -> usize {
-    match firmware.number() {
+fn base_offset(version: FirmwareVersion) -> usize {
+    match version.number() {
         Some(100..=109) => 8,
         _ => 0,
     }
@@ -287,86 +259,52 @@ fn parse_base(data: &[u8], offset: usize) -> Result<Base> {
     Ok(base)
 }
 
-pub fn matrix_addr(mode: u8, layer: u8, slot: usize) -> u16 {
-    ((usize::from(mode * LAYERS_PER_MODE + layer)) * LAYER_BYTES + slot * ACTION_LEN) as u16
-}
-
-pub fn travel_addr(mode: u8, slot: usize) -> u16 {
-    (usize::from(mode) * TRAVEL_BYTES + slot * TRAVEL_RECORD) as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn builds_read_packet() {
-        let p = build(CMD_GET_USE_MATRIX, 0x0810, 56, &[]).unwrap();
+        let p = build(8, 0x0810, 56, &[]).unwrap();
         assert_eq!(&p[..8], &[0x55, 8, 0, 56 + 0x10 + 0x08, 56, 0x10, 0x08, 0]);
         assert!(p[8..].iter().all(|&b| b == 0));
     }
 
     #[test]
     fn refuses_unknown_commands() {
-        assert!(build(238, 0, 0, &[]).is_err());
-        assert!(build(6, 0, 0, &[]).is_err());
-        assert!(build(168, 0, 0, &[]).is_err());
-    }
-
-    #[test]
-    fn guards_matrix_writes() {
-        let a = matrix_addr(1, 0, 2);
-        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0x10, 0, 0x29]).is_ok());
-        assert!(guard_write(CMD_SET_USE_MATRIX, a + 1, &[0x10, 0, 0x29]).is_err());
-        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0x10, 0]).is_err());
-        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0xf0, 0x07, 0]).is_err());
-        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0xf0, 0x08, 0]).is_err());
-        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[]).is_err());
-        assert!(guard_write(CMD_SET_MACRO, 0, &[]).is_err());
-        assert!(guard_write(CMD_SET_USE_MATRIX, matrix_addr(0, 0, 128), &[0x10, 0, 4]).is_err());
-        assert!(guard_write(CMD_SET_USE_MATRIX, matrix_addr(2, 3, 127), &[0x10, 0, 4]).is_ok());
-    }
-
-    #[test]
-    fn guards_macro_writes() {
-        assert!(guard_write(CMD_SET_MACRO, 2048 - 56, &[0; 56]).is_ok());
-        assert!(guard_write(CMD_SET_MACRO, 2048 - 8, &[0; 16]).is_err());
-        assert!(guard_write(CMD_SET_MACRO, 3 * 2048 - 4, &[0; 4]).is_ok());
-        assert!(guard_write(CMD_SET_MACRO, 3 * 2048, &[0; 4]).is_err());
-    }
-
-    #[test]
-    fn guards_travel_writes() {
-        assert!(guard_write(CMD_SET_TRAVEL, travel_addr(2, 127), &[0; 8]).is_ok());
-        assert!(guard_write(CMD_SET_TRAVEL, travel_addr(2, 127) + 8, &[0; 8]).is_err());
-        assert!(guard_write(CMD_SET_TRAVEL, 4, &[0; 8]).is_err());
-        assert!(guard_write(CMD_GET_TRAVEL, 0, &[0; 8]).is_err());
+        for cmd in [238, 6, 168, 169, 242] {
+            assert!(build(cmd, 0, 0, &[]).is_err(), "cmd {cmd}");
+        }
+        for cmd in [3, 4, 7, 8, 9, 12, 13, 160, 161] {
+            assert!(build(cmd, 0, 0, &[]).is_ok(), "cmd {cmd}");
+        }
     }
 
     #[test]
     fn decodes_reply_data_with_key() {
         let mut r = [0u8; REPORT_LEN];
         r[0] = FLAG_REPLY;
-        r[1] = CMD_GET_USE_MATRIX;
+        r[1] = 8;
         r[2] = 0x5a;
         r[8] = 0x10 ^ 0x5a;
         r[9] = 0x5a;
         r[10] = 0x29 ^ 0x5a;
         r[3] = checksum(&r);
-        assert!(check_reply(&r, CMD_GET_USE_MATRIX).is_ok());
+        assert!(check_reply(&r, 8).is_ok());
         assert_eq!(reply_data(&r, 3), vec![0x10, 0, 0x29]);
     }
 
     #[test]
     fn parses_info_and_base() {
         let mut r = [0u8; REPORT_LEN];
-        r[8] = 0x14;
+        r[8] = 0x20;
         r[9] = 0x01;
-        r[10..14].copy_from_slice(b"2025");
+        r[10..30].copy_from_slice(b"Jan 27 2026,10:56:00");
         let info = parse_info(&r);
-        assert_eq!(info.version, "114");
-        assert_eq!(info.built, "2025");
-        assert_eq!(base_offset(&info), 0);
+        assert_eq!(info.version, FirmwareVersion(0x120));
+        assert_eq!(info.version.to_string(), "120");
+        assert_eq!(info.built, "Jan 27 2026,10:56:00");
+        assert_eq!(base_offset(info.version), 0);
 
         let mut data = [0u8; 16];
         data[0] = 1;
@@ -382,10 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn addresses() {
-        assert_eq!(matrix_addr(0, 0, 0), 0);
-        assert_eq!(matrix_addr(1, 0, 1), 4 * 512 + 3);
-        assert_eq!(matrix_addr(2, 3, 60), 11 * 512 + 180);
-        assert_eq!(travel_addr(1, 2), 1024 + 16);
+    fn firmware_versions() {
+        assert_eq!(FirmwareVersion(0x120).number(), Some(120));
+        assert!(FirmwareVersion(0x120).writes_supported());
+        assert!(!FirmwareVersion(0x109).writes_supported());
+        assert!(!FirmwareVersion(0x140).writes_supported());
+        assert_eq!(FirmwareVersion(0x10a).number(), None);
+        assert!(FirmwareVersion(0x10a).check_writes().is_err());
+        assert_eq!(base_offset(FirmwareVersion(0x105)), 8);
     }
 }
