@@ -3,6 +3,7 @@
 //! here touches the device.
 
 use crate::he::actions::Action;
+use crate::he::macros::{MACRO_BYTES, MACRO_COUNT, Macro, decode_region, encode_region};
 use crate::he::protocol::{
     ACTION_LEN, CHUNK, LAYER_BYTES, LAYERS, LAYERS_PER_MODE, MODES, TRAVEL_BYTES, TRAVEL_RECORD,
     matrix_addr, travel_addr,
@@ -133,16 +134,26 @@ pub fn mode_label(mode: u8) -> String {
     format!("m{}", mode + 1)
 }
 
-fn parse_layer(input: &str) -> Result<u8> {
+/// A layer within `mode`: `base`, `fn1`..`fn3`, or NuPhy IO's numbering
+/// across modes (`fn8`..`fn11` are m3's four layers).
+fn parse_layer(mode: u8, input: &str) -> Result<u8> {
     let s = input.trim().to_ascii_lowercase();
-    if s == "fn0" {
-        return Ok(0);
+    if let Some(i) = LAYER_NAMES.iter().position(|n| *n == s) {
+        return Ok(i as u8);
     }
-    LAYER_NAMES
-        .iter()
-        .position(|n| *n == s)
-        .map(|i| i as u8)
-        .with_context(|| format!("unknown layer {input:?} (expected base, fn1, fn2 or fn3)"))
+    if let Some(n) = s.strip_prefix("fn").and_then(|n| n.parse::<u8>().ok())
+        && n < LAYERS
+    {
+        if n / LAYERS_PER_MODE != mode {
+            bail!(
+                "layer {input:?} belongs to {}, not {}",
+                mode_label(n / LAYERS_PER_MODE),
+                mode_label(mode)
+            );
+        }
+        return Ok(n % LAYERS_PER_MODE);
+    }
+    bail!("unknown layer {input:?} (expected base, fn1, fn2 or fn3)")
 }
 
 /// All 12 layers of the key matrix, as read with `GetUseKeyMatrix`.
@@ -351,6 +362,40 @@ impl Travel {
     }
 }
 
+/// All three modes' macro regions, as read with `GetMacro`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Macros(pub Vec<u8>);
+
+impl Macros {
+    pub const BYTES: usize = MODES as usize * MACRO_BYTES;
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.len() != Self::BYTES {
+            bail!(
+                "macro regions are {} bytes, expected {}",
+                bytes.len(),
+                Self::BYTES
+            );
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn region(&self, mode: u8) -> &[u8] {
+        let at = usize::from(mode) * MACRO_BYTES;
+        &self.0[at..at + MACRO_BYTES]
+    }
+
+    pub fn set_region(&mut self, mode: u8, region: &[u8]) {
+        let at = usize::from(mode) * MACRO_BYTES;
+        self.0[at..at + MACRO_BYTES].copy_from_slice(region);
+    }
+
+    pub fn decode(&self, mode: u8) -> Result<Vec<Macro>> {
+        decode_region(self.region(mode))
+            .with_context(|| format!("cannot read the macros of {}", mode_label(mode)))
+    }
+}
+
 /// What a TOML travel entry asks for; unset fields keep the device's value.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TravelSpec {
@@ -494,6 +539,7 @@ impl TravelSpec {
 pub struct Config {
     pub actions: BTreeMap<(u8, u8, usize), Action>,
     pub travel: BTreeMap<(u8, usize), TravelSpec>,
+    pub macros: BTreeMap<(u8, usize), Macro>,
 }
 
 /// Parse a declarative config:
@@ -506,6 +552,10 @@ pub struct Config {
 /// [m1.travel]               # millimetres; unset fields stay as they are
 /// "*" = { actuation = 1.5, trigger = "normal" }
 /// W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
+///
+/// [m1.macros]               # 0..31; a chord, or explicit steps with delays
+/// 0 = "LCTL+Z"
+/// 2 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]
 /// ```
 pub fn parse_config(text: &str) -> Result<Config> {
     let table: toml::Table = text.parse().context("invalid TOML")?;
@@ -524,8 +574,22 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 parse_travel(mode, mode_key, keys, &mut config)?;
                 continue;
             }
+            if section == "macros" {
+                for (key, value) in keys {
+                    let source = format!("{mode_key}.macros.{key}");
+                    let index: usize = key
+                        .parse()
+                        .ok()
+                        .filter(|&i| i < MACRO_COUNT)
+                        .with_context(|| format!("{source}: macro numbers are 0..{MACRO_COUNT}"))?;
+                    config
+                        .macros
+                        .insert((mode, index), Macro::parse(value, &source)?);
+                }
+                continue;
+            }
             let layer =
-                parse_layer(section).with_context(|| format!("in [{mode_key}.{section}]"))?;
+                parse_layer(mode, section).with_context(|| format!("in [{mode_key}.{section}]"))?;
             for (key, value) in keys {
                 let source = format!("{mode_key}.{section}.{key}");
                 let slot = parse_position(key).with_context(|| format!("in {source}"))?;
@@ -594,6 +658,33 @@ impl ActionChange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroChange {
+    pub mode: u8,
+    pub index: usize,
+    pub from: Macro,
+    pub to: Macro,
+}
+
+impl MacroChange {
+    pub fn describe(&self) -> String {
+        let show = |m: &Macro| {
+            if m.0.is_empty() {
+                "(empty)".to_string()
+            } else {
+                m.to_toml()
+            }
+        };
+        format!(
+            "{}.macros {}: {} -> {}",
+            mode_label(self.mode),
+            self.index,
+            show(&self.from),
+            show(&self.to)
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TravelChange {
     pub mode: u8,
     pub slot: usize,
@@ -619,7 +710,8 @@ pub fn plan_changes(
     config: &Config,
     matrix: &Matrix,
     travel: &Travel,
-) -> Result<(Vec<ActionChange>, Vec<TravelChange>)> {
+    macros: &Macros,
+) -> Result<Plan> {
     let mut actions = Vec::new();
     for (&(mode, layer, slot), &to) in &config.actions {
         let from = matrix.get(mode, layer, slot);
@@ -662,7 +754,64 @@ pub fn plan_changes(
             });
         }
     }
-    Ok((actions, records))
+    let mut macro_changes = Vec::new();
+    let mut want_macros = macros.clone();
+    for mode in 0..MODES {
+        let wanted: Vec<_> = config
+            .macros
+            .range((mode, 0)..(mode, MACRO_COUNT))
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let mut list = macros.decode(mode)?;
+        for (&(_, index), to) in wanted {
+            if list[index] != *to {
+                macro_changes.push(MacroChange {
+                    mode,
+                    index,
+                    from: list[index].clone(),
+                    to: to.clone(),
+                });
+                list[index] = to.clone();
+            }
+        }
+        if macro_changes.iter().any(|c| c.mode == mode) {
+            let region =
+                encode_region(&list).with_context(|| format!("{}.macros", mode_label(mode)))?;
+            want_macros.set_region(mode, &region);
+        }
+    }
+    Ok(Plan {
+        actions,
+        travel: records,
+        macros: macro_changes,
+        want_macros,
+    })
+}
+
+/// What `apply` would change, and the macro regions it would write.
+#[derive(Debug)]
+pub struct Plan {
+    pub actions: Vec<ActionChange>,
+    pub travel: Vec<TravelChange>,
+    pub macros: Vec<MacroChange>,
+    pub want_macros: Macros,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty() && self.travel.is_empty() && self.macros.is_empty()
+    }
+
+    pub fn describe(&self) -> Vec<String> {
+        self.actions
+            .iter()
+            .map(ActionChange::describe)
+            .chain(self.travel.iter().map(TravelChange::describe))
+            .chain(self.macros.iter().map(MacroChange::describe))
+            .collect()
+    }
 }
 
 /// Offline checks of a parsed config: every travel entry must fit a record
@@ -674,6 +823,13 @@ pub fn check_config(config: &Config) -> Result<Vec<String>> {
     for (&(mode, slot), spec) in &config.travel {
         spec.apply_to(stock)
             .with_context(|| format!("{}.travel {}", mode_label(mode), position_name(slot)))?;
+    }
+    for mode in 0..MODES {
+        let mut list = vec![Macro::default(); MACRO_COUNT];
+        for (&(_, index), m) in config.macros.range((mode, 0)..(mode, MACRO_COUNT)) {
+            list[index] = m.clone();
+        }
+        encode_region(&list).with_context(|| format!("{}.macros", mode_label(mode)))?;
     }
     Ok(config
         .actions
@@ -726,6 +882,29 @@ pub fn plan_action_writes(changes: &[ActionChange]) -> Vec<WriteChunk> {
     )
 }
 
+/// Packets that turn `current` macro regions into `want`, skipping the
+/// packet-sized windows that already match.
+pub fn plan_macro_writes(current: &Macros, want: &Macros) -> Vec<WriteChunk> {
+    let mut out = Vec::new();
+    for mode in 0..MODES {
+        let base = usize::from(mode) * MACRO_BYTES;
+        for at in (0..MACRO_BYTES).step_by(CHUNK) {
+            let end = (at + CHUNK).min(MACRO_BYTES);
+            let (a, b) = (
+                &current.0[base + at..base + end],
+                &want.0[base + at..base + end],
+            );
+            if a != b {
+                out.push(WriteChunk {
+                    addr: (base + at) as u16,
+                    data: b.to_vec(),
+                });
+            }
+        }
+    }
+    out
+}
+
 pub fn plan_travel_writes(changes: &[TravelChange]) -> Vec<WriteChunk> {
     coalesce(
         changes
@@ -737,7 +916,13 @@ pub fn plan_travel_writes(changes: &[TravelChange]) -> Vec<WriteChunk> {
 
 /// Render the given modes as a config: actions that differ from the factory
 /// matrix, and the travel table as a `"*"` default plus per-key differences.
-pub fn export_config(modes: &[u8], current: &Matrix, factory: &Matrix, travel: &Travel) -> String {
+pub fn export_config(
+    modes: &[u8],
+    current: &Matrix,
+    factory: &Matrix,
+    travel: &Travel,
+    macros: &Macros,
+) -> Result<String> {
     let mut out = String::from(
         "# nuphyctl he: key actions that differ from the factory matrix, and key travel (mm)\n# apply with: nuphyctl he apply <this file>\n",
     );
@@ -758,6 +943,15 @@ pub fn export_config(modes: &[u8], current: &Matrix, factory: &Matrix, travel: &
                     current.get(mode, layer, slot),
                     factory.get(mode, layer, slot)
                 ));
+            }
+        }
+        let list = macros.decode(mode)?;
+        if list.iter().any(|m| !m.0.is_empty()) {
+            out.push_str(&format!("\n[{m}.macros]\n"));
+            for (index, mac) in list.iter().enumerate() {
+                if !mac.0.is_empty() {
+                    out.push_str(&format!("{index} = {}\n", mac.to_toml()));
+                }
             }
         }
         let specs: Vec<TravelSpec> = (0..key_count())
@@ -786,7 +980,7 @@ pub fn export_config(modes: &[u8], current: &Matrix, factory: &Matrix, travel: &
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn toml_key(name: &str) -> String {
@@ -825,10 +1019,15 @@ mod tests {
         assert_eq!(parse_mode("2").unwrap(), 1);
         assert!(parse_mode("m4").is_err());
         assert!(parse_mode("m0").is_err());
-        assert_eq!(parse_layer("base").unwrap(), 0);
-        assert_eq!(parse_layer("fn0").unwrap(), 0);
-        assert_eq!(parse_layer("FN3").unwrap(), 3);
-        assert!(parse_layer("fn4").is_err());
+        assert_eq!(parse_layer(0, "base").unwrap(), 0);
+        assert_eq!(parse_layer(0, "fn0").unwrap(), 0);
+        assert_eq!(parse_layer(0, "FN3").unwrap(), 3);
+        assert!(parse_layer(0, "fn4").is_err());
+        assert_eq!(parse_layer(2, "fn8").unwrap(), 0);
+        assert_eq!(parse_layer(2, "fn11").unwrap(), 3);
+        assert_eq!(parse_layer(2, "fn3").unwrap(), 3);
+        assert!(parse_layer(1, "fn11").is_err());
+        assert!(parse_layer(0, "fn12").is_err());
     }
 
     /// Records from a real Air60 HE export: switch 2 (Jade Pro), 1.50 mm
@@ -880,6 +1079,11 @@ mod tests {
         m
     }
 
+    fn blank_macros() -> Macros {
+        let region = encode_region(&vec![Macro::default(); MACRO_COUNT]).unwrap();
+        Macros(region.repeat(usize::from(MODES)))
+    }
+
     fn blank_travel() -> Travel {
         let mut t = Travel(vec![0; Travel::BYTES]);
         for mode in 0..MODES {
@@ -901,6 +1105,9 @@ mod tests {
         [m1.travel]
         "*" = { actuation = 1.5 }
         W = { actuation = 0.5, trigger = "rapid", press = 0.1 }
+
+        [m1.macros]
+        0 = "LCTL+Z"
     "##;
 
     #[test]
@@ -929,6 +1136,8 @@ mod tests {
         assert!(parse_config("[m1.travel]\nW = { actuation = \"x\" }").is_err());
         assert!(parse_config("[m1.travel]\nW = { speed = 1 }").is_err());
         assert!(parse_config("[m1.travel]\nW = { trigger = \"fast\" }").is_err());
+        assert!(parse_config("[m1.macros]\n32 = \"LCTL+C\"").is_err());
+        assert!(parse_config("[m1.macros]\n0 = [\"C sideways\"]").is_err());
     }
 
     #[test]
@@ -936,38 +1145,45 @@ mod tests {
         let config = parse_config(SAMPLE).unwrap();
         let matrix = blank_matrix();
         let travel = blank_travel();
-        let (actions, records) = plan_changes(&config, &matrix, &travel).unwrap();
-        assert_eq!(actions.len(), 3);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].slot, 16);
-        assert_eq!(records[0].to.trigger(), 1);
+        let macros = blank_macros();
+        let plan = plan_changes(&config, &matrix, &travel, &macros).unwrap();
+        assert_eq!(plan.actions.len(), 3);
+        assert_eq!(plan.travel.len(), 1);
+        assert_eq!(plan.travel[0].slot, 16);
+        assert_eq!(plan.travel[0].to.trigger(), 1);
+        assert_eq!(plan.macros.len(), 1);
+        assert!(!plan_macro_writes(&macros, &plan.want_macros).is_empty());
 
         let mut m2 = matrix.clone();
-        for c in &actions {
+        for c in &plan.actions {
             m2.set(c.mode, c.layer, c.slot, c.to);
         }
         let mut t2 = travel.clone();
-        for c in &records {
+        for c in &plan.travel {
             t2.set(c.mode, c.slot, c.to);
         }
-        let (a, r) = plan_changes(&config, &m2, &t2).unwrap();
-        assert!(a.is_empty() && r.is_empty());
+        let again = plan_changes(&config, &m2, &t2, &plan.want_macros).unwrap();
+        assert!(again.is_empty(), "{:?}", again.describe());
     }
 
     #[test]
     fn refuses_unmanaged_actions() {
         let mut matrix = blank_matrix();
         let travel = blank_travel();
+        let macros = blank_macros();
         let config = parse_config("[m1.base]\nESC = \"0x950020\"").unwrap();
-        assert!(plan_changes(&config, &matrix, &travel).is_err());
+        assert!(plan_changes(&config, &matrix, &travel, &macros).is_err());
         let config = parse_config("[m1.base]\nESC = \"FACTORY_RESET\"").unwrap();
-        assert!(plan_changes(&config, &matrix, &travel).is_err());
+        assert!(plan_changes(&config, &matrix, &travel, &macros).is_err());
         matrix.set(0, 0, 0, Action([0x95, 0, 0x20]));
         let config = parse_config("[m1.base]\nESC = \"ESC\"").unwrap();
-        assert!(plan_changes(&config, &matrix, &travel).is_err());
+        assert!(plan_changes(&config, &matrix, &travel, &macros).is_err());
         let config = parse_config("[m1.base]\nESC = \"0x950020\"").unwrap();
-        let (a, _) = plan_changes(&config, &matrix, &travel).unwrap();
-        assert!(a.is_empty());
+        assert!(
+            plan_changes(&config, &matrix, &travel, &macros)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1032,8 +1248,14 @@ mod tests {
         w.set_trigger(1);
         travel.set(0, 16, w);
 
-        let text = export_config(&[0], &current, &factory, &travel);
+        let mut macros = blank_macros();
+        let mut list = vec![Macro::default(); MACRO_COUNT];
+        list[4] = Macro::chord("LCTL+C").unwrap();
+        macros.set_region(0, &encode_region(&list).unwrap());
+
+        let text = export_config(&[0], &current, &factory, &travel, &macros).unwrap();
         assert!(text.contains("[m1.base]\nCAPS = \"FN(2)\""), "{text}");
+        assert!(text.contains("[m1.macros]\n4 = \"LCTL+C\""), "{text}");
         assert!(
             text.contains("\"*\" = { actuation = 1.5, trigger = \"normal\""),
             "{text}"
@@ -1044,10 +1266,11 @@ mod tests {
         );
 
         let config = parse_config(&text).unwrap();
-        let (a, r) = plan_changes(&config, &current, &travel).unwrap();
-        assert!(a.is_empty() && r.is_empty(), "{a:?} {r:?}");
-        let (a, r) = plan_changes(&config, &factory, &blank_travel()).unwrap();
-        assert_eq!(a.len(), 2);
-        assert_eq!(r.len(), 1);
+        let plan = plan_changes(&config, &current, &travel, &macros).unwrap();
+        assert!(plan.is_empty(), "{:?}", plan.describe());
+        let plan = plan_changes(&config, &factory, &blank_travel(), &blank_macros()).unwrap();
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(plan.travel.len(), 1);
+        assert_eq!(plan.macros.len(), 1);
     }
 }

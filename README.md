@@ -4,7 +4,7 @@
 
 - Set main/backlight, side-light, and decorative RGB effects.
 - Read, remap, back up, and restore keymaps, including declarative TOML configuration.
-- Hall-effect boards (Air60 HE): key actions and per-key travel (actuation point, Rapid Trigger, dead zones) from a declarative TOML file.
+- Hall-effect boards (Air60 HE): key actions, per-key travel (actuation point, Rapid Trigger, dead zones) and macros from a declarative TOML file.
 - List HID devices and send raw reports for reverse engineering.
 
 ## Installation

@@ -231,19 +231,28 @@ M = "MACRO(0)"
 [m1.travel]
 "*" = { actuation = 1.5, trigger = "normal" }
 W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
+
+[m1.macros]               # 0..31, bound to a key as MACRO(n)
+4 = "LCTL+C"              # chord: modifiers down, key tap, modifiers up
+2 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]   # steps, delay in ms
+3 = []                    # empty
 ```
+
+A layer can also be named the way NuPhy IO numbers them across modes:
+`[m3.fn11]` is the same as `[m3.fn3]`.
 
 Actions are key names with optional modifiers (`LCTL+C`), media names (`VOLU`,
 `MUTE`), `FN(n)`, `MACRO(n)`, keyboard functions (`SLEEP`, `LIGHT_TOGGLE`) or
 raw `0xKKAABB`. Fields of a travel entry: `actuation`, `trigger` (`normal`,
 `rapid`, `continuous`), `press`, `release`, `upper_deadzone`, `lower_deadzone`.
 
-Writes are deliberately narrow. `apply` writes only key actions and travel
-records, refuses DKS, Mod-Tap, Toggle and Snap Tap keys (assign or remove those
+Writes are deliberately narrow. `apply` writes only key actions, travel
+records and macro regions (rewritten whole per mode, laid out as NuPhy IO lays
+them out), refuses DKS, Mod-Tap, Toggle and Snap Tap keys (assign or remove those
 in NuPhy IO), never assigns factory reset or the firmware loader, and sends no
 command outside the read and write commands it needs. Before writing it saves
-the matrix and travel tables to `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`, and
-afterwards reads both back and fails unless they match.
+the matrix, travel tables and macros to `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`,
+and afterwards reads them back and fails unless they match.
 
 ## Device selection
 

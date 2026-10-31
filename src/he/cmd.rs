@@ -5,13 +5,13 @@ use crate::cli::{
     HeRestoreBackupArgs, HeTravelArgs,
 };
 use crate::he::model::{
-    ActionChange, LAYER_NAMES, Matrix, TRIGGERS, Travel, TravelChange, check_config, export_config,
-    key_count, mode_label, parse_config, parse_mode, plan_action_writes, plan_changes,
-    plan_travel_writes, position_name,
+    ActionChange, LAYER_NAMES, MacroChange, Macros, Matrix, Plan, TRIGGERS, Travel, TravelChange,
+    check_config, export_config, key_count, mode_label, parse_config, parse_mode,
+    plan_action_writes, plan_changes, plan_macro_writes, plan_travel_writes, position_name,
 };
 use crate::he::protocol::{
-    Base, CMD_GET_DEFAULT_MATRIX, CMD_GET_TRAVEL, CMD_GET_USE_MATRIX, CMD_SET_TRAVEL,
-    CMD_SET_USE_MATRIX, FirmwareInfo, HeProtocol, LAYERS_PER_MODE, MODES,
+    Base, CMD_GET_DEFAULT_MATRIX, CMD_GET_MACRO, CMD_GET_TRAVEL, CMD_GET_USE_MATRIX, CMD_SET_MACRO,
+    CMD_SET_TRAVEL, CMD_SET_USE_MATRIX, FirmwareInfo, HeProtocol, LAYERS_PER_MODE, MODES,
 };
 use crate::hid_transport::{clear_input_reports, open_selected_device};
 use crate::keymap::{default_backup_dir, write_backup};
@@ -45,15 +45,21 @@ impl Keyboard<'_> {
         Travel::from_bytes(self.protocol.read(CMD_GET_TRAVEL, 0, Travel::BYTES)?)
     }
 
-    /// Back up matrix and travel, write the changes, read both back and
-    /// require them to match.
-    fn write_and_verify(
-        &self,
-        matrix: &Matrix,
-        travel: &Travel,
-        actions: &[ActionChange],
-        records: &[TravelChange],
-    ) -> Result<PathBuf> {
+    fn macros(&self) -> Result<Macros> {
+        Macros::from_bytes(self.protocol.read(CMD_GET_MACRO, 0, Macros::BYTES)?)
+    }
+
+    fn state(&self) -> Result<State> {
+        Ok(State {
+            matrix: self.matrix(false)?,
+            travel: self.travel()?,
+            macros: self.macros()?,
+        })
+    }
+
+    /// Back up the current state, write the plan, read everything back and
+    /// require it to match.
+    fn write_and_verify(&self, current: &State, plan: &Plan) -> Result<PathBuf> {
         let number = self.firmware.number().unwrap_or(0);
         if !WRITE_FIRMWARE.contains(&number) {
             bail!(
@@ -63,7 +69,7 @@ impl Keyboard<'_> {
                 WRITE_FIRMWARE.end()
             );
         }
-        let backup = backup(matrix, travel)?;
+        let backup = backup(current)?;
         eprintln!("backup: {}", backup.display());
         let restore_hint = || {
             format!(
@@ -72,30 +78,35 @@ impl Keyboard<'_> {
             )
         };
 
-        let mut want_matrix = matrix.clone();
-        for c in actions {
-            want_matrix.set(c.mode, c.layer, c.slot, c.to);
+        let mut want = State {
+            matrix: current.matrix.clone(),
+            travel: current.travel.clone(),
+            macros: plan.want_macros.clone(),
+        };
+        for c in &plan.actions {
+            want.matrix.set(c.mode, c.layer, c.slot, c.to);
         }
-        let mut want_travel = travel.clone();
-        for c in records {
-            want_travel.set(c.mode, c.slot, c.to);
+        for c in &plan.travel {
+            want.travel.set(c.mode, c.slot, c.to);
         }
-        for chunk in plan_action_writes(actions) {
+        for chunk in plan_action_writes(&plan.actions) {
             self.protocol
                 .write(CMD_SET_USE_MATRIX, chunk.addr, &chunk.data)
                 .with_context(restore_hint)?;
         }
-        for chunk in plan_travel_writes(records) {
+        for chunk in plan_travel_writes(&plan.travel) {
             self.protocol
                 .write(CMD_SET_TRAVEL, chunk.addr, &chunk.data)
                 .with_context(restore_hint)?;
         }
+        for chunk in plan_macro_writes(&current.macros, &want.macros) {
+            self.protocol
+                .write(CMD_SET_MACRO, chunk.addr, &chunk.data)
+                .with_context(restore_hint)?;
+        }
 
-        let after_matrix = self
-            .matrix(false)
-            .context("failed to read the matrix back")?;
-        let after_travel = self.travel().context("failed to read travel back")?;
-        if after_matrix != want_matrix || after_travel != want_travel {
+        let after = self.state().context("failed to read the keyboard back")?;
+        if after != want {
             bail!(
                 "verification failed: the keyboard does not hold what was written; restore with: nuphyctl he restore-backup {}",
                 backup.display()
@@ -105,9 +116,22 @@ impl Keyboard<'_> {
     }
 }
 
-fn backup(matrix: &Matrix, travel: &Travel) -> Result<PathBuf> {
-    let mut bytes = matrix.0.clone();
-    bytes.extend_from_slice(&travel.0);
+/// Everything `apply` manages: key matrix, travel tables, macro regions.
+#[derive(Debug, PartialEq, Eq)]
+struct State {
+    matrix: Matrix,
+    travel: Travel,
+    macros: Macros,
+}
+
+const BACKUP_BYTES: usize = Matrix::BYTES + Travel::BYTES + Macros::BYTES;
+/// Backups written before macros were managed hold matrix and travel only.
+const LEGACY_BACKUP_BYTES: usize = Matrix::BYTES + Travel::BYTES;
+
+fn backup(state: &State) -> Result<PathBuf> {
+    let mut bytes = state.matrix.0.clone();
+    bytes.extend_from_slice(&state.travel.0);
+    bytes.extend_from_slice(&state.macros.0);
     write_backup(&default_backup_dir()?, "he", &bytes)
         .context("failed to save a backup; nothing was written")
 }
@@ -278,10 +302,18 @@ pub fn run_travel(api: &HidApi, args: &HeTravelArgs) -> Result<()> {
 pub fn run_export(api: &HidApi, args: &HeExportArgs) -> Result<()> {
     let modes = selected_modes(args.mode.as_deref())?;
     with_keyboard(api, &args.device, |kb| {
-        let current = kb.matrix(false)?;
+        let state = kb.state()?;
         let factory = kb.matrix(true)?;
-        let travel = kb.travel()?;
-        print!("{}", export_config(&modes, &current, &factory, &travel));
+        print!(
+            "{}",
+            export_config(
+                &modes,
+                &state.matrix,
+                &factory,
+                &state.travel,
+                &state.macros
+            )?
+        );
         Ok(())
     })
 }
@@ -297,9 +329,10 @@ pub fn run_check(args: &HeCheckArgs) -> Result<()> {
         println!("note: {note}");
     }
     println!(
-        "ok: {} key action(s), {} travel entr(ies)",
+        "ok: {} key action(s), {} travel entr(ies), {} macro(s)",
         config.actions.len(),
-        config.travel.len()
+        config.travel.len(),
+        config.macros.len()
     );
     Ok(())
 }
@@ -310,52 +343,46 @@ pub fn run_apply(api: &HidApi, args: &HeApplyArgs) -> Result<()> {
     let config =
         parse_config(&text).with_context(|| format!("invalid config {}", args.file.display()))?;
     with_keyboard(api, &args.device, |kb| {
-        let matrix = kb.matrix(false)?;
-        let travel = kb.travel()?;
-        let (actions, records) = plan_changes(&config, &matrix, &travel)?;
-        let backup = if args.dry_run || (actions.is_empty() && records.is_empty()) {
+        let state = kb.state()?;
+        let plan = plan_changes(&config, &state.matrix, &state.travel, &state.macros)?;
+        let backup = if args.dry_run || plan.is_empty() {
             None
         } else {
-            Some(kb.write_and_verify(&matrix, &travel, &actions, &records)?)
+            Some(kb.write_and_verify(&state, &plan)?)
         };
-        report(
-            args.json,
-            &args.file,
-            &actions,
-            &records,
-            args.dry_run,
-            backup,
-        )
+        report(args.json, &args.file, &plan, args.dry_run, backup)
     })
 }
 
 pub fn run_restore_backup(api: &HidApi, args: &HeRestoreBackupArgs) -> Result<()> {
     let bytes = std::fs::read(&args.file)
         .with_context(|| format!("failed to read {}", args.file.display()))?;
-    if bytes.len() != Matrix::BYTES + Travel::BYTES {
+    if bytes.len() != BACKUP_BYTES && bytes.len() != LEGACY_BACKUP_BYTES {
         bail!(
-            "{} is {} bytes, not an HE backup ({} bytes)",
+            "{} is {} bytes, not an HE backup ({BACKUP_BYTES} bytes)",
             args.file.display(),
-            bytes.len(),
-            Matrix::BYTES + Travel::BYTES
+            bytes.len()
         );
     }
-    let want_matrix = Matrix::from_bytes(bytes[..Matrix::BYTES].to_vec())?;
-    let want_travel = Travel::from_bytes(bytes[Matrix::BYTES..].to_vec())?;
+    let (m, rest) = bytes.split_at(Matrix::BYTES);
+    let (t, saved_macros) = rest.split_at(Travel::BYTES);
+    let want_matrix = Matrix::from_bytes(m.to_vec())?;
+    let want_travel = Travel::from_bytes(t.to_vec())?;
     with_keyboard(api, &args.device, |kb| {
-        let matrix = kb.matrix(false)?;
-        let travel = kb.travel()?;
-        let mut actions = Vec::new();
-        let mut records = Vec::new();
+        let state = kb.state()?;
+        let mut plan = Plan {
+            actions: Vec::new(),
+            travel: Vec::new(),
+            macros: Vec::new(),
+            want_macros: state.macros.clone(),
+        };
         for mode in 0..MODES {
             for slot in 0..crate::he::protocol::MATRIX_SLOTS {
                 for layer in 0..LAYERS_PER_MODE {
-                    let (from, to) = (
-                        matrix.get(mode, layer, slot),
-                        want_matrix.get(mode, layer, slot),
-                    );
+                    let from = state.matrix.get(mode, layer, slot);
+                    let to = want_matrix.get(mode, layer, slot);
                     if from != to {
-                        actions.push(ActionChange {
+                        plan.actions.push(ActionChange {
                             mode,
                             layer,
                             slot,
@@ -364,9 +391,9 @@ pub fn run_restore_backup(api: &HidApi, args: &HeRestoreBackupArgs) -> Result<()
                         });
                     }
                 }
-                let (from, to) = (travel.get(mode, slot), want_travel.get(mode, slot));
+                let (from, to) = (state.travel.get(mode, slot), want_travel.get(mode, slot));
                 if from != to {
-                    records.push(TravelChange {
+                    plan.travel.push(TravelChange {
                         mode,
                         slot,
                         from,
@@ -375,59 +402,66 @@ pub fn run_restore_backup(api: &HidApi, args: &HeRestoreBackupArgs) -> Result<()
                 }
             }
         }
-        let backup = if args.dry_run || (actions.is_empty() && records.is_empty()) {
+        if !saved_macros.is_empty() {
+            let saved = Macros::from_bytes(saved_macros.to_vec())?;
+            for mode in 0..MODES {
+                let (now, then) = (state.macros.decode(mode)?, saved.decode(mode)?);
+                let changed: Vec<_> = (0..now.len())
+                    .filter(|&i| now[i] != then[i])
+                    .map(|index| MacroChange {
+                        mode,
+                        index,
+                        from: now[index].clone(),
+                        to: then[index].clone(),
+                    })
+                    .collect();
+                if !changed.is_empty() {
+                    plan.want_macros.set_region(mode, saved.region(mode));
+                    plan.macros.extend(changed);
+                }
+            }
+        }
+        let backup = if args.dry_run || plan.is_empty() {
             None
         } else {
-            Some(kb.write_and_verify(&matrix, &travel, &actions, &records)?)
+            Some(kb.write_and_verify(&state, &plan)?)
         };
-        report(
-            args.json,
-            &args.file,
-            &actions,
-            &records,
-            args.dry_run,
-            backup,
-        )
+        report(args.json, &args.file, &plan, args.dry_run, backup)
     })
 }
 
 fn report(
     as_json: bool,
     file: &std::path::Path,
-    actions: &[ActionChange],
-    records: &[TravelChange],
+    plan: &Plan,
     dry_run: bool,
     backup: Option<PathBuf>,
 ) -> Result<()> {
+    let changes = plan.describe();
     if as_json {
         return print_json(&json!({
             "file": file.display().to_string(),
-            "actions": actions.iter().map(ActionChange::describe).collect::<Vec<_>>(),
-            "travel": records.iter().map(TravelChange::describe).collect::<Vec<_>>(),
+            "changes": changes,
             "dry_run": dry_run,
             "written": backup.is_some(),
             "verified": backup.is_some(),
             "backup": backup.map(|p| p.display().to_string()),
         }));
     }
-    if actions.is_empty() && records.is_empty() {
+    if changes.is_empty() {
         println!(
             "no changes: the keyboard already matches {}",
             file.display()
         );
         return Ok(());
     }
-    for c in actions {
-        println!("{}", c.describe());
+    for line in &changes {
+        println!("{line}");
     }
-    for c in records {
-        println!("{}", c.describe());
-    }
-    let n = actions.len() + records.len();
     if dry_run {
-        println!("dry run: {n} change(s), nothing written");
+        println!("dry run: {} change(s), nothing written", changes.len());
     } else {
-        println!("{n} change(s) written and verified");
+        println!("{} change(s) written and verified", changes.len());
     }
     Ok(())
 }

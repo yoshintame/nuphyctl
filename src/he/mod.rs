@@ -3,5 +3,6 @@
 
 pub mod actions;
 pub mod cmd;
+pub mod macros;
 pub mod model;
 pub mod protocol;

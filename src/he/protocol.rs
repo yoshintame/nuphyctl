@@ -41,6 +41,8 @@ pub const CMD_GET_BASE: u8 = 4;
 pub const CMD_GET_DEFAULT_MATRIX: u8 = 7;
 pub const CMD_GET_USE_MATRIX: u8 = 8;
 pub const CMD_SET_USE_MATRIX: u8 = 9;
+pub const CMD_GET_MACRO: u8 = 12;
+pub const CMD_SET_MACRO: u8 = 13;
 pub const CMD_GET_TRAVEL: u8 = 160;
 pub const CMD_SET_TRAVEL: u8 = 161;
 
@@ -53,6 +55,8 @@ const ALLOWED: &[u8] = &[
     CMD_GET_DEFAULT_MATRIX,
     CMD_GET_USE_MATRIX,
     CMD_SET_USE_MATRIX,
+    CMD_GET_MACRO,
+    CMD_SET_MACRO,
     CMD_GET_TRAVEL,
     CMD_SET_TRAVEL,
 ];
@@ -193,6 +197,15 @@ fn guard_write(cmd: u8, addr: u16, data: &[u8]) -> Result<()> {
                 bail!("write reaches past the last mode's travel table");
             }
         }
+        CMD_SET_MACRO => {
+            let region = crate::he::macros::MACRO_BYTES;
+            if addr / region != (addr + data.len() - 1) / region {
+                bail!("a macro write stays within one mode's region");
+            }
+            if addr + data.len() > usize::from(MODES) * region {
+                bail!("write reaches past the last mode's macro region");
+            }
+        }
         _ => bail!("command {cmd} is not a write this tool makes"),
     }
     Ok(())
@@ -302,6 +315,14 @@ mod tests {
         assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0xf0, 0x07, 0]).is_err());
         assert!(guard_write(CMD_SET_USE_MATRIX, matrix_addr(0, 0, 128), &[0x10, 0, 4]).is_err());
         assert!(guard_write(CMD_SET_USE_MATRIX, matrix_addr(2, 3, 127), &[0x10, 0, 4]).is_ok());
+    }
+
+    #[test]
+    fn guards_macro_writes() {
+        assert!(guard_write(CMD_SET_MACRO, 2048 - 56, &[0; 56]).is_ok());
+        assert!(guard_write(CMD_SET_MACRO, 2048 - 8, &[0; 16]).is_err());
+        assert!(guard_write(CMD_SET_MACRO, 3 * 2048 - 4, &[0; 4]).is_ok());
+        assert!(guard_write(CMD_SET_MACRO, 3 * 2048, &[0; 4]).is_err());
     }
 
     #[test]
