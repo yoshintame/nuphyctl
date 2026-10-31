@@ -565,7 +565,7 @@ pub struct HeApplyArgs {
 
 #[derive(Args, Debug)]
 pub struct HeRestoreArgs {
-    /// Backup file written by `he apply` or `he restore-backup`
+    /// Backup file written by `he apply` or `he restore-backup` (not one printed as the half-written state)
     pub backup: PathBuf,
 
     #[command(flatten)]

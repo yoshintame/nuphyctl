@@ -1,6 +1,6 @@
 //! `nuphyctl he ...` command handlers.
 
-use crate::backup::{default_backup_dir, write_backup};
+use crate::backup::write_backup;
 use crate::cli::{
     DeviceSelector, HeApplyArgs, HeCheckArgs, HeDumpArgs, HeExportArgs, HeInfoArgs, HeReadArgs,
     HeRestoreArgs, HeWriteArgs,
@@ -8,7 +8,7 @@ use crate::cli::{
 use crate::he::actions::Action;
 use crate::he::config::{check_config, export_config, load_config};
 use crate::he::layout::{KeyRef, TravelRef, key_count, layer_name, mode_label, position_name};
-use crate::he::pending;
+use crate::he::pending::{self, Pending};
 use crate::he::plan::{Plan, plan_changes, plan_restore};
 use crate::he::protocol::{Base, FirmwareInfo, HeProtocol};
 use crate::he::region::{LAYERS_PER_MODE, MODES, Region, WriteChunk};
@@ -62,9 +62,9 @@ impl Keyboard<'_> {
         Matrix::from_bytes(self.protocol.read_factory_matrix()?)
     }
 
-    fn write(&self, plan: &Plan) -> Result<PathBuf> {
+    fn write(&self, pending: &Pending, plan: &Plan) -> Result<PathBuf> {
         write_and_verify(
-            &default_backup_dir()?,
+            pending,
             self.identity(),
             plan,
             |region, chunk| self.protocol.write(region, chunk),
@@ -73,7 +73,7 @@ impl Keyboard<'_> {
     }
 }
 
-/// Back up the plan's current state into `dir`, mark the write unfinished,
+/// Back up the plan's current state next to `pending`, mark the write unfinished,
 /// `send` the plan's writes, `read_back` everything and require it to equal
 /// the wanted state. Returns the new backup; on failure the error names the
 /// backup to restore. Only a restore may start while an earlier write is
@@ -81,25 +81,37 @@ impl Keyboard<'_> {
 /// own backup, of possibly half-written data, is marked so it is never
 /// restored.
 fn write_and_verify(
-    dir: &Path,
+    pending: &Pending,
     identity: Identity,
     plan: &Plan,
     mut send: impl FnMut(Region, &WriteChunk) -> Result<()>,
     read_back: impl FnOnce() -> Result<State>,
 ) -> Result<PathBuf> {
     identity.firmware.check_writes()?;
-    if !plan.is_restore() {
-        pending::ensure_none_in(dir)?;
+    let earlier = pending.unfinished()?;
+    if let Some(earlier) = &earlier
+        && !plan.is_restore()
+    {
+        bail!(pending::refusal(earlier));
     }
-    let over_unfinished = pending::unfinished_in(dir)?.is_some();
     let header = Header {
         identity,
-        over_unfinished,
+        over_unfinished: earlier.is_some(),
     };
-    let backup = write_backup(dir, "he", &snapshot::encode(header, plan.current()))
-        .context("failed to save a backup; nothing was written")?;
-    let restore = pending::begin_in(dir, &backup, plan.is_restore())?;
-    if over_unfinished {
+    let backup = write_backup(
+        pending.dir(),
+        "he",
+        &snapshot::encode(header, plan.current()),
+    )
+    .context("failed to save a backup; nothing was written")?;
+    let restore = match earlier {
+        Some(earlier) => earlier,
+        None => {
+            pending.begin(&backup)?;
+            backup.clone()
+        }
+    };
+    if header.over_unfinished {
         eprintln!(
             "backup of the half-written state (never restored): {}",
             backup.display()
@@ -119,7 +131,7 @@ fn write_and_verify(
             restore_hint()
         );
     }
-    pending::end_in(dir)?;
+    pending.end()?;
     Ok(backup)
 }
 
@@ -159,11 +171,13 @@ fn modes(mode: Option<u8>) -> Vec<u8> {
 
 /// Reading commands still work after an unfinished write, but say so.
 fn warn_if_unfinished() -> Result<()> {
-    if let Some(backup) = pending::unfinished()? {
-        eprintln!(
+    match Pending::in_default_dir()?.unfinished() {
+        Ok(None) => {}
+        Ok(Some(backup)) => eprintln!(
             "warning: a previous write did not finish; the keyboard may hold half-written data ({})",
             pending::restore_hint(&backup)
-        );
+        ),
+        Err(err) => eprintln!("warning: {err:#}"),
     }
     Ok(())
 }
@@ -317,7 +331,9 @@ pub fn run_travel(api: &mut HidApi, args: &HeReadArgs) -> Result<()> {
 }
 
 pub fn run_export(api: &mut HidApi, args: &HeExportArgs) -> Result<()> {
-    pending::ensure_none()?;
+    let pending = Pending::in_default_dir()?;
+    let _lock = pending.lock()?;
+    pending.ensure_none()?;
     with_keyboard(api, &args.device, |kb| {
         let state = kb.state()?;
         let factory = kb.factory_matrix()?;
@@ -338,14 +354,16 @@ pub fn run_check(args: &HeCheckArgs) -> Result<()> {
 }
 
 pub fn run_apply(api: &mut HidApi, args: &HeApplyArgs) -> Result<()> {
-    pending::ensure_none()?;
+    let pending = Pending::in_default_dir()?;
+    let _lock = pending.lock()?;
+    pending.ensure_none()?;
     let config = load_config(&args.config)?;
     let notes = check_config(&config)
         .with_context(|| format!("invalid config {}", args.config.display()))?;
     with_keyboard(api, &args.write.device, |kb| {
         let mut plan = plan_changes(&config, &kb.state()?)?;
         plan.add_notes(notes);
-        finish(kb, &args.write, &args.config, &plan).map(drop)
+        finish(kb, &pending, &args.write, &args.config, &plan)
     })
 }
 
@@ -355,8 +373,10 @@ pub fn run_restore_backup(api: &mut HidApi, args: &HeRestoreArgs) -> Result<()> 
         std::fs::read(file).with_context(|| format!("failed to read {}", file.display()))?;
     let (header, saved) =
         snapshot::decode(&bytes).with_context(|| format!("cannot use {}", file.display()))?;
+    let pending = Pending::in_default_dir()?;
+    let _lock = pending.lock()?;
     if header.over_unfinished {
-        let instead = match pending::unfinished()? {
+        let instead = match pending.unfinished()? {
             Some(earlier) => pending::restore_hint(&earlier),
             None => "restore the backup the interrupted write printed first".to_string(),
         };
@@ -385,12 +405,7 @@ pub fn run_restore_backup(api: &mut HidApi, args: &HeRestoreArgs) -> Result<()> 
                 identity.firmware, here.firmware
             )]);
         }
-        let outcome = finish(kb, &args.write, file, &plan)?;
-        if matches!(outcome, Outcome::NoChanges) && !args.write.dry_run {
-            // The keyboard now holds the backup: any unfinished write is undone.
-            pending::end()?;
-        }
-        Ok(())
+        finish(kb, &pending, &args.write, file, &plan)
     })
 }
 
@@ -403,19 +418,28 @@ enum Outcome {
 /// The plan's writes were checked when it was made; check the firmware too,
 /// so a dry run fails exactly where a real run would; then write unless it
 /// is a dry run.
-fn finish(kb: &Keyboard, args: &HeWriteArgs, file: &Path, plan: &Plan) -> Result<Outcome> {
+fn finish(
+    kb: &Keyboard,
+    pending: &Pending,
+    args: &HeWriteArgs,
+    file: &Path,
+    plan: &Plan,
+) -> Result<()> {
     let outcome = if plan.is_empty() {
+        if plan.is_restore() && !args.dry_run {
+            // The keyboard now holds the backup: any unfinished write is undone.
+            pending.end()?;
+        }
         Outcome::NoChanges
     } else {
         kb.firmware.version.check_writes()?;
         if args.dry_run {
             Outcome::DryRun
         } else {
-            Outcome::Written(kb.write(plan)?)
+            Outcome::Written(kb.write(pending, plan)?)
         }
     };
-    report(args.json, file, plan, &outcome)?;
-    Ok(outcome)
+    report(args.json, file, plan, &outcome)
 }
 
 fn report(as_json: bool, file: &Path, plan: &Plan, outcome: &Outcome) -> Result<()> {
@@ -476,7 +500,7 @@ mod tests {
     impl FakeKeyboard {
         fn write(&self, dir: &Path, plan: &Plan) -> Result<PathBuf> {
             write_and_verify(
-                dir,
+                &Pending::new(dir.to_path_buf()),
                 ID,
                 plan,
                 |region, chunk| {
@@ -534,7 +558,7 @@ mod tests {
         assert!(apply.writes().len() >= 3, "{:?}", apply.writes());
         kb.budget.set(apply.writes().len() - 1);
         let err = format!("{:#}", kb.write(&dir, &apply).unwrap_err());
-        let first = pending::unfinished_in(&dir).unwrap().unwrap();
+        let first = Pending::new(dir.clone()).unfinished().unwrap().unwrap();
         assert!(err.contains(&first.display().to_string()), "{err}");
         assert_eq!(saved(&first), good);
 
@@ -543,7 +567,10 @@ mod tests {
         kb.budget.set(1);
         let err = format!("{:#}", kb.write(&dir, &restore).unwrap_err());
         assert!(err.contains(&first.display().to_string()), "{err}");
-        assert_eq!(pending::unfinished_in(&dir).unwrap(), Some(first.clone()));
+        assert_eq!(
+            Pending::new(dir.clone()).unfinished().unwrap(),
+            Some(first.clone())
+        );
         let marked: Vec<bool> = backups(&dir)
             .iter()
             .map(|p| header(p).over_unfinished)
@@ -562,7 +589,7 @@ mod tests {
         let restore = plan_restore(&kb.now(), &saved(&first)).unwrap();
         kb.write(&dir, &restore).unwrap();
         assert_eq!(kb.now(), good);
-        assert_eq!(pending::unfinished_in(&dir).unwrap(), None);
+        assert_eq!(Pending::new(dir.clone()).unfinished().unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -577,7 +604,7 @@ mod tests {
         };
         let sent = Cell::new(0);
         let err = write_and_verify(
-            &dir,
+            &Pending::new(dir.clone()),
             old,
             &plan,
             |_, _| {

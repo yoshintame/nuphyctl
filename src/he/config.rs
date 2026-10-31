@@ -17,6 +17,7 @@
 //! 3 = ["LGUI down 1", "SPC down 1", "SPC up 1", "LGUI up"]
 //! ```
 
+use crate::he::ONLY_IF_HELD;
 use crate::he::actions::Action;
 use crate::he::layout::{
     KeyRef, MacroRef, TravelRef, key_count, layer_name, mode_label, parse_layer, parse_mode,
@@ -25,7 +26,7 @@ use crate::he::layout::{
 use crate::he::macros::{Macro, encode_region};
 use crate::he::region::{LAYERS_PER_MODE, MACRO_COUNT, MODES};
 use crate::he::state::{Matrix, State};
-use crate::he::travel::{ONLY_IF_HELD, TravelSpec};
+use crate::he::travel::TravelSpec;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -196,6 +197,14 @@ pub fn check_config(config: &Config) -> Result<Vec<String>> {
         for (at, spec) in section.entries(mode) {
             let found = spec.check_offline().with_context(|| at.clone())?;
             notes.extend(found.into_iter().map(|note| format!("{at}: {note}")));
+        }
+        for (&slot, spec) in &section.keys {
+            let at = TravelRef { mode, slot };
+            notes.extend(
+                spec.coarse_notes()
+                    .into_iter()
+                    .map(|note| format!("{at}: {note}")),
+            );
         }
     }
     for mode in (0..MODES).filter(|&m| config.sets_macros(m)) {

@@ -85,6 +85,12 @@ pub fn decode(bytes: &[u8]) -> Result<(Header, State)> {
         at += r.len();
         part
     });
+    if bytes[13] & !OVER_UNFINISHED != 0 {
+        bail!(
+            "backup flags {:#04x} are not known to this version",
+            bytes[13]
+        );
+    }
     let header = Header {
         identity,
         over_unfinished: bytes[13] & OVER_UNFINISHED != 0,
@@ -117,6 +123,9 @@ mod tests {
             ..header
         };
         assert_eq!(decode(&encode(marked, &state)).unwrap().0, marked);
+        let mut unknown = bytes.clone();
+        unknown[13] = 0x02;
+        assert!(decode(&unknown).is_err(), "unknown flags are refused");
 
         let mut wrong_format = bytes.clone();
         wrong_format[12] = 2;

@@ -1,6 +1,9 @@
 //! NuPhy Hall-effect boards (Air60 HE and siblings): a separate protocol
 //! family from the Air75 V3 one in `nuphy_protocol`.
 
+/// What a note says about a value this tool does not write.
+pub const ONLY_IF_HELD: &str = "apply passes only if the keyboard already holds it";
+
 pub mod actions;
 pub mod cmd;
 pub mod config;

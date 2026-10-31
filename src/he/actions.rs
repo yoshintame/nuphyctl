@@ -30,7 +30,6 @@ const MACRO_HOLD: u8 = 0x00;
 const MACRO_TOGGLE: u8 = 0xff;
 const FIRMWARE_LOADER: u8 = 0x07;
 const FACTORY_RESET: u8 = 0x08;
-const FROZEN_REFUSAL: &str = "no command writes it, so restore-backup could not put it back";
 
 /// The three bytes of a matrix slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +71,16 @@ pub enum Policy {
     Kept(&'static str),
     /// The firmware loader and factory reset, whatever the third byte holds:
     /// never written by any command, so never replaced either.
-    Frozen,
+    Frozen(&'static str),
+}
+
+impl Policy {
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Free => None,
+            Self::ReplaceOnly(why) | Self::Kept(why) | Self::Frozen(why) => Some(why),
+        }
+    }
 }
 
 /// How a macro key plays its macro, checked on an Air60 HE.
@@ -112,10 +120,13 @@ impl MacroMode {
 
     fn parse(input: &str) -> Result<Self> {
         let input = input.trim();
+        if input.eq_ignore_ascii_case("once") {
+            return Ok(Self::Once);
+        }
         Self::ALL
             .into_iter()
             .find(|m| m.name().is_some_and(|n| n.eq_ignore_ascii_case(input)))
-            .with_context(|| format!("macro mode {input:?} is not hold or toggle"))
+            .with_context(|| format!("macro mode {input:?} is not once, hold or toggle"))
     }
 }
 
@@ -229,7 +240,7 @@ impl Action {
     /// What `apply` and `restore-backup` may do with this action.
     pub fn policy(self) -> Policy {
         if matches!(self.0, [KIND_FUNCTION, FIRMWARE_LOADER | FACTORY_RESET, _]) {
-            return Policy::Frozen;
+            return Policy::Frozen("no command writes it, so restore-backup could not put it back");
         }
         match self.kind() {
             ActionKind::Function(code) if !function(code).is_some_and(|f| f.assignable) => {
@@ -245,26 +256,21 @@ impl Action {
 
     /// Why `apply` may not put this action on a key, if it may not.
     pub fn assign_refusal(self) -> Option<&'static str> {
-        match self.policy() {
-            Policy::Free => None,
-            Policy::ReplaceOnly(why) | Policy::Kept(why) => Some(why),
-            Policy::Frozen => Some(FROZEN_REFUSAL),
-        }
+        self.policy().reason()
     }
 
     /// Why `apply` may not replace this action with another, if it may not.
     pub fn replace_refusal(self) -> Option<&'static str> {
         match self.policy() {
-            Policy::Free | Policy::ReplaceOnly(_) => None,
-            Policy::Kept(why) => Some(why),
-            Policy::Frozen => Some(FROZEN_REFUSAL),
+            Policy::ReplaceOnly(_) => None,
+            policy => policy.reason(),
         }
     }
 
     /// Never written to the keyboard by any command, `restore-backup`
     /// included.
     pub fn never_write(self) -> bool {
-        self.policy() == Policy::Frozen
+        matches!(self.policy(), Policy::Frozen(_))
     }
 
     /// The absolute layer of a momentary-layer action.
@@ -413,6 +419,7 @@ mod tests {
         assert_eq!("macro(1)".parse::<Action>().unwrap(), a([0x70, 0, 1]));
         assert_eq!("MACRO(32)".parse::<Action>().unwrap(), a([0x70, 31, 1]));
         assert_eq!("MACRO(5, hold)".parse::<Action>().unwrap(), a([0x70, 4, 0]));
+        assert_eq!("MACRO(5, once)".parse::<Action>().unwrap(), a([0x70, 4, 1]));
         assert_eq!(
             "macro(5,Toggle)".parse::<Action>().unwrap(),
             a([0x70, 4, 0xff])

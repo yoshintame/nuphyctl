@@ -258,6 +258,9 @@ the key is held, `MACRO(n, toggle)` until the key is pressed again (NuPhy IO's
 "Press key to stop"); stopping a toggle can cut the macro off half way and
 leave a modifier held until the keyboard is unplugged. NuPhy IO's "Set the
 loop times" counts do not play that many times on the Air60 HE and stay raw.
+`MACRO(n, once)` is accepted too. Configs written before named modes used
+`MACRO(n)` for the repeat-until-pressed mode; `apply` notes each key it
+would turn from that into once.
 
 Writes are deliberately narrow:
 
@@ -292,7 +295,10 @@ Writes are deliberately narrow:
   clears it. A `restore-backup` that stops half way itself leaves the marker
   naming the first backup, the one taken before the damage; its own backup is
   printed as the half-written state, flagged in its header, and refused by
-  `restore-backup`.
+  `restore-backup`. A backup with header flags this version does not know is
+  refused too.
+- `apply`, `restore-backup` and `export` hold `$XDG_STATE_HOME/nuphyctl/he.lock`
+  while they work, so only one of them talks to the keyboard at a time.
 
 Backups start with a header (format version, vendor and product id, firmware
 version). `restore-backup` refuses a backup of another board and notes a

@@ -284,42 +284,37 @@ pub fn encode_region(macros: &[Macro]) -> Result<Vec<u8>> {
         .iter()
         .rposition(|m| !m.0.is_empty())
         .map_or(0, |i| i + 1);
-    let mut at = HEADER;
-    let mut empty_at = None;
     let mut offsets = [0usize; MACRO_COUNT];
-    for (i, m) in macros.iter().enumerate().take(used) {
-        offsets[i] = at;
-        let steps: Vec<[u8; STEP]> = if m.0.is_empty() {
-            empty_at.get_or_insert(at);
-            vec![EMPTY_STEP]
-        } else {
-            m.0.iter()
-                .enumerate()
-                .map(|(n, s)| step_bytes(s, n + 1 == m.0.len()))
-                .collect()
-        };
-        for b in steps {
-            if at + STEP > MACRO_BYTES {
-                bail!("macros do not fit the {MACRO_BYTES}-byte region");
-            }
-            region[at..at + STEP].copy_from_slice(&b);
-            at += STEP;
+    let mut at = HEADER;
+    let mut push = |step: [u8; STEP]| -> Result<usize> {
+        if at + STEP > MACRO_BYTES {
+            bail!("macros do not fit the {MACRO_BYTES}-byte region");
         }
+        region[at..at + STEP].copy_from_slice(&step);
+        at += STEP;
+        Ok(at - STEP)
+    };
+    let mut empty_at = None;
+    for (i, m) in macros.iter().enumerate().take(used) {
+        offsets[i] = if m.0.is_empty() {
+            let start = push(EMPTY_STEP)?;
+            empty_at.get_or_insert(start);
+            start
+        } else {
+            let mut start = None;
+            for (n, s) in m.0.iter().enumerate() {
+                let placed = push(step_bytes(s, n + 1 == m.0.len()))?;
+                start.get_or_insert(placed);
+            }
+            start.expect("a macro with steps")
+        };
     }
     if used < MACRO_COUNT {
         let empty_at = match empty_at {
             Some(e) => e,
-            None => {
-                if at + STEP > MACRO_BYTES {
-                    bail!("macros do not fit the {MACRO_BYTES}-byte region");
-                }
-                region[at..at + STEP].copy_from_slice(&EMPTY_STEP);
-                at
-            }
+            None => push(EMPTY_STEP)?,
         };
-        for off in offsets.iter_mut().skip(used) {
-            *off = empty_at;
-        }
+        offsets[used..].fill(empty_at);
     }
     for (i, off) in offsets.iter().enumerate() {
         region[2 * i] = *off as u8;
@@ -498,6 +493,19 @@ mod tests {
         assert!(decode_region(&broken).is_err());
         let never_written = decode_region(&vec![0u8; MACRO_BYTES]).unwrap();
         assert!(never_written.iter().all(|m| m.0.is_empty()));
+    }
+
+    /// Every empty macro before the last used one gets an empty step of its
+    /// own; the unused ones after it share the first.
+    #[test]
+    fn empty_macros_keep_their_own_steps() {
+        let mut list = vec![Macro::default(); MACRO_COUNT];
+        list[2] = Macro::chord("LCTL+C").unwrap();
+        let region = encode_region(&list).unwrap();
+        let offset = |i: usize| usize::from(region[2 * i]) | usize::from(region[2 * i + 1]) << 8;
+        assert_eq!([offset(0), offset(1), offset(2)], [64, 68, 72]);
+        assert!((3..MACRO_COUNT).all(|i| offset(i) == 64));
+        assert_eq!(decode_region(&region).unwrap(), list);
     }
 
     /// 32 macros that fill the region to the last byte fit; one step more

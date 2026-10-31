@@ -222,7 +222,9 @@ pub fn connect_with_retry(api: &mut HidApi, selector: &DeviceSelector) -> Result
         thread::sleep(Duration::from_millis(
             CONNECT_RETRY_BASE_DELAY_MS * attempt as u64,
         ));
-        api.refresh_devices()?;
+        if let Err(refresh) = api.refresh_devices() {
+            eprintln!("could not refresh the HID device list: {refresh}");
+        }
     }
 }
 

@@ -2,6 +2,7 @@
 //! report and the packets to send both come from diffing it against the
 //! current state, once, so they cannot disagree.
 
+use crate::he::actions::{ActionKind, MacroMode};
 use crate::he::config::Config;
 use crate::he::layout::{KeyRef, TravelRef, key_count};
 use crate::he::region::{
@@ -18,15 +19,22 @@ pub struct Plan {
     writes: Vec<(Region, WriteChunk)>,
     /// Things worth knowing that the plan does not change.
     notes: Vec<String>,
+    purpose: Purpose,
+}
+
+/// What a plan is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    Apply,
     /// Brings back a backup: the one write that may start while an earlier
     /// one is unfinished.
-    restore: bool,
+    Restore,
 }
 
 impl Plan {
     /// Diff `want` against `current` into changes and packets, every packet
     /// checked against its region's write rules.
-    fn new(current: State, want: State, notes: Vec<String>, restore: bool) -> Result<Self> {
+    fn new(current: State, want: State, notes: Vec<String>, purpose: Purpose) -> Result<Self> {
         let changes = current.changes_to(&want);
         let mut writes = Vec::new();
         for region in Region::ALL {
@@ -41,12 +49,12 @@ impl Plan {
             changes,
             writes,
             notes,
-            restore,
+            purpose,
         })
     }
 
     pub fn is_restore(&self) -> bool {
-        self.restore
+        self.purpose == Purpose::Restore
     }
 
     pub fn is_empty(&self) -> bool {
@@ -84,6 +92,7 @@ impl Plan {
 /// this tool does not assign, and keys whose action it may not replace.
 pub fn plan_changes(config: &Config, current: &State) -> Result<Plan> {
     let mut want = current.clone();
+    let mut notes = Vec::new();
     for (&at, &to) in &config.actions {
         let from = current.matrix.action(at);
         if from == to {
@@ -94,6 +103,22 @@ pub fn plan_changes(config: &Config, current: &State) -> Result<Plan> {
         }
         if let Some(why) = from.replace_refusal() {
             bail!("{at}: the key holds {from}: {why}; change it in NuPhy IO first");
+        }
+        if let (
+            ActionKind::Macro {
+                slot,
+                mode: MacroMode::Toggle,
+            },
+            ActionKind::Macro {
+                slot: to_slot,
+                mode: MacroMode::Once,
+            },
+        ) = (from.kind(), to.kind())
+            && slot == to_slot
+        {
+            notes.push(format!(
+                "{at}: {to} plays once; the key repeats {from} until pressed again, so write {from} to keep that (MACRO(n) meant toggle before nuphyctl 9616150)"
+            ));
         }
         want.matrix.set_action(at, to);
     }
@@ -118,7 +143,7 @@ pub fn plan_changes(config: &Config, current: &State) -> Result<Plan> {
             want.macros.set_macros(mode, &wanted)?;
         }
     }
-    Plan::new(current.clone(), want, Vec::new(), false)
+    Plan::new(current.clone(), want, notes, Purpose::Apply)
 }
 
 /// The plan that brings `current` back to `backup`, byte for byte wherever
@@ -164,7 +189,7 @@ pub fn plan_restore(current: &State, backup: &State) -> Result<Plan> {
             want.macros.copy_region(mode, &current.macros);
         }
     }
-    Plan::new(current.clone(), want, notes, true)
+    Plan::new(current.clone(), want, notes, Purpose::Restore)
 }
 
 #[cfg(test)]
@@ -189,6 +214,27 @@ mod tests {
         let again = plan_changes(&parse_config(SAMPLE).unwrap(), plan.want()).unwrap();
         assert!(again.is_empty(), "{:?}", again.changes());
         assert!(again.writes().is_empty());
+    }
+
+    #[test]
+    fn notes_a_toggle_macro_turning_into_once() {
+        let mut current = blank_state();
+        let w = KeyRef {
+            mode: 0,
+            layer: 2,
+            slot: 16,
+        };
+        current.matrix.set_action(w, Action([0x70, 4, 0xff]));
+        let once = parse_config("[m1.fn2]\nW = \"MACRO(5)\"").unwrap();
+        let plan = plan_changes(&once, &current).unwrap();
+        assert_eq!(plan.changes().len(), 1);
+        assert!(
+            plan.notes().len() == 1 && plan.notes()[0].contains("MACRO(5, toggle)"),
+            "{:?}",
+            plan.notes()
+        );
+        let kept = parse_config("[m1.fn2]\nW = \"MACRO(5, toggle)\"").unwrap();
+        assert!(plan_changes(&kept, &current).unwrap().is_empty());
     }
 
     #[test]

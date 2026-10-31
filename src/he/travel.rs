@@ -2,6 +2,7 @@
 //! spec a config file gives for it. Lengths are whole micrometres inside and
 //! millimetres at the TOML boundary.
 
+use crate::he::ONLY_IF_HELD;
 use crate::he::region::TRAVEL_RECORD;
 use anyhow::{Context, Result, bail};
 use std::fmt;
@@ -24,15 +25,41 @@ pub struct TravelRecord(pub [u8; TRAVEL_RECORD]);
 const NINE_BITS: u16 = 0x1ff;
 const TRAVEL_STEP_UM: u32 = 10;
 const DEAD_ZONE_MAX: u16 = 0x7f;
-/// What a note says about a value this tool does not write.
-pub const ONLY_IF_HELD: &str = "apply passes only if the keyboard already holds it";
 
-/// Rapid Trigger sensitivity step selected by two bits of byte 3.
-fn step_um(bits: u8) -> u32 {
-    match bits & 3 {
-        1 => 5,
-        2 => 1,
-        _ => 10,
+/// Rapid Trigger step sizes a record can select, two bits of byte 3 each for
+/// press and release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RtStep {
+    Um10,
+    Um5,
+    Um1,
+}
+
+impl RtStep {
+    const ALL: [Self; 3] = [Self::Um10, Self::Um5, Self::Um1];
+
+    fn bits(self) -> u8 {
+        match self {
+            Self::Um10 => 0,
+            Self::Um5 => 1,
+            Self::Um1 => 2,
+        }
+    }
+
+    /// The step two bits select; the unused value reads as 0.01 mm.
+    fn from_bits(bits: u8) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.bits() == bits & 3)
+            .unwrap_or(Self::Um10)
+    }
+
+    fn um(self) -> u32 {
+        match self {
+            Self::Um10 => 10,
+            Self::Um5 => 5,
+            Self::Um1 => 1,
+        }
     }
 }
 
@@ -63,11 +90,11 @@ impl TravelRecord {
     }
 
     fn press_step(&self) -> u32 {
-        step_um(self.0[3] >> 1)
+        RtStep::from_bits(self.0[3] >> 1).um()
     }
 
     fn release_step(&self) -> u32 {
-        step_um(self.0[3] >> 3)
+        RtStep::from_bits(self.0[3] >> 3).um()
     }
 
     pub fn actuation_um(&self) -> u32 {
@@ -268,8 +295,6 @@ pub struct Field {
     /// Values this tool writes. The keyboard may hold others, which `apply`
     /// leaves alone as long as the config asks for what is already there.
     writable: RangeInclusive<u32>,
-    /// Counted in Rapid Trigger steps, whose size the record itself selects.
-    pub sensitivity: bool,
 }
 
 impl Field {
@@ -298,7 +323,6 @@ pub static FIELDS: [Field; 5] = [
         get: TravelRecord::actuation_um,
         store: TravelRecord::store_actuation_um,
         writable: 100..=3300,
-        sensitivity: false,
     },
     Field {
         id: FieldId::Press,
@@ -306,7 +330,6 @@ pub static FIELDS: [Field; 5] = [
         get: TravelRecord::press_um,
         store: TravelRecord::store_press_um,
         writable: 1..=3300,
-        sensitivity: true,
     },
     Field {
         id: FieldId::Release,
@@ -314,7 +337,6 @@ pub static FIELDS: [Field; 5] = [
         get: TravelRecord::release_um,
         store: TravelRecord::store_release_um,
         writable: 1..=3300,
-        sensitivity: true,
     },
     Field {
         id: FieldId::UpperDeadzone,
@@ -322,7 +344,6 @@ pub static FIELDS: [Field; 5] = [
         get: TravelRecord::upper_deadzone_um,
         store: TravelRecord::store_upper_deadzone_um,
         writable: 0..=1280,
-        sensitivity: false,
     },
     Field {
         id: FieldId::LowerDeadzone,
@@ -330,30 +351,25 @@ pub static FIELDS: [Field; 5] = [
         get: TravelRecord::lower_deadzone_um,
         store: TravelRecord::store_lower_deadzone_um,
         writable: 0..=1280,
-        sensitivity: false,
     },
 ];
-
-/// Rapid Trigger step sizes a record can select, as byte 3 encodes them for
-/// both press and release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Step {
-    Um10,
-    Um5,
-    Um1,
-}
 
 impl TravelRecord {
     /// A stock record (switch 2, 1.50 mm, normal trigger) with `step` for
     /// both press and release: what offline checks validate against.
-    pub fn stock(step: Step) -> Self {
-        let bits = match step {
-            Step::Um10 => 0,
-            Step::Um5 => 1,
-            Step::Um1 => 2,
-        };
+    pub fn stock(step: RtStep) -> Self {
+        let bits = step.bits();
         Self([0xa2, 0, 0x95, (bits << 1) | (bits << 3), 0, 0, 0, 0])
     }
+}
+
+/// The Rapid Trigger steps at which a record can hold `um` in `field`: all
+/// or none for lengths the step does not scale.
+fn fitting_steps(field: &Field, um: u32) -> Vec<RtStep> {
+    RtStep::ALL
+        .into_iter()
+        .filter(|&s| (field.store)(&mut TravelRecord::stock(s), um).is_ok())
+        .collect()
 }
 
 /// What a config travel entry asks for; unset fields keep the keyboard's value.
@@ -411,12 +427,12 @@ impl TravelSpec {
         Ok(record)
     }
 
-    /// Checks without a keyboard: every value must fit a record, or the
-    /// entry is an error. What only the keyboard can settle comes back as
-    /// notes: a sensitivity that needs a finer step than 0.01 mm (which step
-    /// a key uses is known at apply), and a value outside what this tool
-    /// writes, or a trigger without a name (apply passes only if the key
-    /// already holds it), and a sensitivity too coarse for the finer steps.
+    /// Checks without a keyboard: every value must fit a record at some
+    /// Rapid Trigger step, or the entry is an error. What only the keyboard
+    /// can settle comes back as notes: a sensitivity that needs a finer step
+    /// than 0.01 mm (which step a key uses is known at apply), and a value
+    /// outside what this tool writes, or a trigger without a name (apply
+    /// passes only if the key already holds it).
     pub fn check_offline(&self) -> Result<Vec<String>> {
         let mut notes = Vec::new();
         if let Some(Trigger::Raw(n)) = self.trigger {
@@ -426,24 +442,16 @@ impl TravelSpec {
             let Some(um) = self.length(field.id) else {
                 continue;
             };
-            let fits = |step| (field.store)(&mut TravelRecord::stock(step), um);
-            if let Err(err) = fits(Step::Um10) {
-                if !field.sensitivity
-                    || [Step::Um5, Step::Um1].into_iter().all(|s| fits(s).is_err())
-                {
-                    return Err(err.context(field.name));
-                }
+            let fits = fitting_steps(field, um);
+            if fits.is_empty() {
+                let err = (field.store)(&mut TravelRecord::stock(RtStep::Um10), um)
+                    .expect_err("no step fits");
+                return Err(err.context(field.name));
+            }
+            if !fits.contains(&RtStep::Um10) {
                 notes.push(format!(
                     "{} needs a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one",
                     field.name
-                ));
-            } else if field.sensitivity
-                && [Step::Um5, Step::Um1].into_iter().any(|s| fits(s).is_err())
-            {
-                notes.push(format!(
-                    "{} {} mm does not fit a key with a finer Rapid Trigger step; apply fails on such keys",
-                    field.name,
-                    mm(um)
                 ));
             }
             if !field.writable.contains(&um) {
@@ -451,6 +459,25 @@ impl TravelSpec {
             }
         }
         Ok(notes)
+    }
+
+    /// For one key's own entry: a value that fits the 0.01 mm step but not a
+    /// finer one, which apply refuses if the key uses that finer step.
+    pub fn coarse_notes(&self) -> Vec<String> {
+        FIELDS
+            .iter()
+            .filter_map(|field| {
+                let um = self.length(field.id)?;
+                let fits = fitting_steps(field, um);
+                (fits.contains(&RtStep::Um10) && fits.len() < RtStep::ALL.len()).then(|| {
+                    format!(
+                        "{} {} mm does not fit a key with a finer Rapid Trigger step; apply fails on such keys",
+                        field.name,
+                        mm(um)
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn parse(value: &toml::Value, source: &str) -> Result<Self> {
@@ -616,11 +643,19 @@ mod tests {
         let finer = spec(FieldId::Press, 105).check_offline().unwrap();
         assert!(finer.len() == 1 && finer[0].contains("finer"), "{finer:?}");
         assert_eq!(spec(FieldId::Press, 3).check_offline().unwrap().len(), 1);
-        let coarse = spec(FieldId::Press, 600).check_offline().unwrap();
+        assert!(
+            spec(FieldId::Press, 600)
+                .check_offline()
+                .unwrap()
+                .is_empty()
+        );
+        let coarse = spec(FieldId::Press, 600).coarse_notes();
         assert!(
             coarse.len() == 1 && coarse[0].contains("finer Rapid Trigger step;"),
             "{coarse:?}"
         );
+        assert!(spec(FieldId::Press, 100).coarse_notes().is_empty());
+        assert!(spec(FieldId::Actuation, 3000).coarse_notes().is_empty());
         let raw = TravelSpec {
             trigger: Some(Trigger::Raw(7)),
             ..Default::default()
@@ -651,8 +686,8 @@ mod tests {
         ] {
             assert!(spec(id, um).check_offline().is_err(), "{id:?} {um}");
         }
-        assert_eq!(TravelRecord::stock(Step::Um1).press_um(), 1);
-        assert_eq!(TravelRecord::stock(Step::Um5).release_um(), 5);
+        assert_eq!(TravelRecord::stock(RtStep::Um1).press_um(), 1);
+        assert_eq!(TravelRecord::stock(RtStep::Um5).release_um(), 5);
     }
 
     #[test]
