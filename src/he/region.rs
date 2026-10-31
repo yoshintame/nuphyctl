@@ -10,7 +10,8 @@ pub const LAYERS_PER_MODE: u8 = 4;
 pub const LAYERS: u8 = MODES * LAYERS_PER_MODE;
 pub const MATRIX_SLOTS: usize = 128;
 pub const ACTION_LEN: usize = 3;
-/// One layer: 128 slots of 3 bytes, then 16 G keys from byte 464.
+/// One layer: 128 slots of 3 bytes, unused bytes, then 16 G keys from
+/// byte 464.
 pub const LAYER_BYTES: usize = 512;
 pub const TRAVEL_RECORD: usize = 8;
 /// One mode's travel table: 128 records of 8 bytes.
@@ -42,45 +43,49 @@ struct Spec {
     /// Writes cover whole entries: a key action, a travel record, a macro step.
     unit: usize,
     /// Bytes of a segment this tool writes; matrix bytes past the 128 slots
-    /// (the G keys) are never written.
+    /// (unused bytes, then the G keys) are never written.
     writable: usize,
 }
 
-static SPECS: [Spec; 3] = [
-    Spec {
-        name: "key matrix",
-        get_cmd: 8,
-        set_cmd: 9,
-        segment: LAYER_BYTES,
-        segments: LAYERS as usize,
-        unit: ACTION_LEN,
-        writable: MATRIX_SLOTS * ACTION_LEN,
-    },
-    Spec {
-        name: "travel",
-        get_cmd: 160,
-        set_cmd: 161,
-        segment: TRAVEL_BYTES,
-        segments: MODES as usize,
-        unit: TRAVEL_RECORD,
-        writable: TRAVEL_BYTES,
-    },
-    Spec {
-        name: "macros",
-        get_cmd: 12,
-        set_cmd: 13,
-        segment: MACRO_BYTES,
-        segments: MODES as usize,
-        unit: 4,
-        writable: MACRO_BYTES,
-    },
-];
+const MATRIX: Spec = Spec {
+    name: "key matrix",
+    get_cmd: 8,
+    set_cmd: 9,
+    segment: LAYER_BYTES,
+    segments: LAYERS as usize,
+    unit: ACTION_LEN,
+    writable: MATRIX_SLOTS * ACTION_LEN,
+};
+
+const TRAVEL: Spec = Spec {
+    name: "travel",
+    get_cmd: 160,
+    set_cmd: 161,
+    segment: TRAVEL_BYTES,
+    segments: MODES as usize,
+    unit: TRAVEL_RECORD,
+    writable: TRAVEL_BYTES,
+};
+
+const MACROS: Spec = Spec {
+    name: "macros",
+    get_cmd: 12,
+    set_cmd: 13,
+    segment: MACRO_BYTES,
+    segments: MODES as usize,
+    unit: 4,
+    writable: MACRO_BYTES,
+};
 
 impl Region {
     pub const ALL: [Self; 3] = [Self::Matrix, Self::Travel, Self::Macros];
 
     const fn spec(self) -> &'static Spec {
-        &SPECS[self as usize]
+        match self {
+            Self::Matrix => &MATRIX,
+            Self::Travel => &TRAVEL,
+            Self::Macros => &MACROS,
+        }
     }
 
     pub const fn len(self) -> usize {

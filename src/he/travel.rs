@@ -5,6 +5,7 @@
 use crate::he::region::TRAVEL_RECORD;
 use anyhow::{Context, Result, bail};
 use std::fmt;
+use std::ops::RangeInclusive;
 
 /// One key's travel settings. Setters change only their own bits, so
 /// unknown bits (the switch type, the firmware's check mark, Snap Tap
@@ -22,9 +23,7 @@ pub struct TravelRecord(pub [u8; TRAVEL_RECORD]);
 
 const NINE_BITS: u16 = 0x1ff;
 const TRAVEL_STEP_UM: u32 = 10;
-const ACTUATION_UM: std::ops::RangeInclusive<u32> = 100..=3300;
-const SENSITIVITY_UM: std::ops::RangeInclusive<u32> = 1..=3300;
-const DEAD_ZONE_UM: std::ops::RangeInclusive<u32> = 20..=1280;
+const DEAD_ZONE_MAX: u16 = 0x7f;
 
 /// Rapid Trigger sensitivity step selected by two bits of byte 3.
 fn step_um(bits: u8) -> u32 {
@@ -42,6 +41,11 @@ impl TravelRecord {
 
     fn set_word(&mut self, at: usize, v: u16) {
         [self.0[at], self.0[at + 1]] = v.to_le_bytes();
+    }
+
+    /// The record's bytes in hex, as `travel --json` shows them.
+    pub fn hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     pub fn switch_type(&self) -> u8 {
@@ -94,45 +98,30 @@ impl TravelRecord {
         self.set_word(at, (w & NINE_BITS) | (value << 9));
     }
 
-    pub fn set_actuation_um(&mut self, um: u32) -> Result<()> {
-        check_range("actuation", um, &ACTUATION_UM)?;
+    fn store_actuation_um(&mut self, um: u32) -> Result<()> {
         self.set_low9(2, units(um, TRAVEL_STEP_UM)?);
         Ok(())
     }
 
-    pub fn set_press_um(&mut self, um: u32) -> Result<()> {
-        check_range("press", um, &SENSITIVITY_UM)?;
+    fn store_press_um(&mut self, um: u32) -> Result<()> {
         self.set_low9(4, units(um, self.press_step())?);
         Ok(())
     }
 
-    pub fn set_release_um(&mut self, um: u32) -> Result<()> {
-        check_range("release", um, &SENSITIVITY_UM)?;
+    fn store_release_um(&mut self, um: u32) -> Result<()> {
         self.set_low9(6, units(um, self.release_step())?);
         Ok(())
     }
 
-    pub fn set_upper_deadzone_um(&mut self, um: u32) -> Result<()> {
+    fn store_upper_deadzone_um(&mut self, um: u32) -> Result<()> {
         self.set_high7(4, dead_units(um)?);
         Ok(())
     }
 
-    pub fn set_lower_deadzone_um(&mut self, um: u32) -> Result<()> {
+    fn store_lower_deadzone_um(&mut self, um: u32) -> Result<()> {
         self.set_high7(6, dead_units(um)?);
         Ok(())
     }
-}
-
-fn check_range(what: &str, um: u32, range: &std::ops::RangeInclusive<u32>) -> Result<()> {
-    if !range.contains(&um) {
-        bail!(
-            "{what} {} mm out of range ({}..={} mm)",
-            mm(um),
-            mm(*range.start()),
-            mm(*range.end())
-        );
-    }
-    Ok(())
 }
 
 /// Records store `value - 1` steps: 1.50 mm at 0.01 mm steps is 149.
@@ -159,12 +148,16 @@ fn dead_um(v: u16) -> u32 {
     }
 }
 
+/// Dead zones store `value - 1` steps in 7 bits, and 0 for none.
 fn dead_units(um: u32) -> Result<u16> {
     if um == 0 {
         return Ok(0);
     }
-    check_range("dead zone", um, &DEAD_ZONE_UM)?;
-    units(um, TRAVEL_STEP_UM)
+    let v = units(um, TRAVEL_STEP_UM)?;
+    if !(1..=DEAD_ZONE_MAX).contains(&v) {
+        bail!("dead zone {} mm does not fit the record", mm(um));
+    }
+    Ok(v)
 }
 
 /// Micrometres as a millimetre literal without trailing zeros: `1.5`, `0.01`, `0`.
@@ -268,9 +261,32 @@ pub struct Field {
     pub id: FieldId,
     pub name: &'static str,
     pub get: fn(&TravelRecord) -> u32,
-    set: fn(&mut TravelRecord, u32) -> Result<()>,
+    /// Stores any value the record can hold, inside `writable` or not.
+    store: fn(&mut TravelRecord, u32) -> Result<()>,
+    /// Values this tool writes. The keyboard may hold others, which `apply`
+    /// leaves alone as long as the config asks for what is already there.
+    writable: RangeInclusive<u32>,
     /// Counted in Rapid Trigger steps, whose size the record itself selects.
     pub sensitivity: bool,
+}
+
+impl Field {
+    pub fn set(&self, record: &mut TravelRecord, um: u32) -> Result<()> {
+        if !self.writable.contains(&um) {
+            bail!("{}", self.outside_writable(um));
+        }
+        (self.store)(record, um).with_context(|| self.name)
+    }
+
+    fn outside_writable(&self, um: u32) -> String {
+        format!(
+            "{} {} mm is outside what this tool writes ({}..={} mm)",
+            self.name,
+            mm(um),
+            mm(*self.writable.start()),
+            mm(*self.writable.end())
+        )
+    }
 }
 
 pub static FIELDS: [Field; 5] = [
@@ -278,35 +294,40 @@ pub static FIELDS: [Field; 5] = [
         id: FieldId::Actuation,
         name: "actuation",
         get: TravelRecord::actuation_um,
-        set: TravelRecord::set_actuation_um,
+        store: TravelRecord::store_actuation_um,
+        writable: 100..=3300,
         sensitivity: false,
     },
     Field {
         id: FieldId::Press,
         name: "press",
         get: TravelRecord::press_um,
-        set: TravelRecord::set_press_um,
+        store: TravelRecord::store_press_um,
+        writable: 1..=3300,
         sensitivity: true,
     },
     Field {
         id: FieldId::Release,
         name: "release",
         get: TravelRecord::release_um,
-        set: TravelRecord::set_release_um,
+        store: TravelRecord::store_release_um,
+        writable: 1..=3300,
         sensitivity: true,
     },
     Field {
         id: FieldId::UpperDeadzone,
         name: "upper_deadzone",
         get: TravelRecord::upper_deadzone_um,
-        set: TravelRecord::set_upper_deadzone_um,
+        store: TravelRecord::store_upper_deadzone_um,
+        writable: 0..=1280,
         sensitivity: false,
     },
     Field {
         id: FieldId::LowerDeadzone,
         name: "lower_deadzone",
         get: TravelRecord::lower_deadzone_um,
-        set: TravelRecord::set_lower_deadzone_um,
+        store: TravelRecord::store_lower_deadzone_um,
+        writable: 0..=1280,
         sensitivity: false,
     },
 ];
@@ -377,31 +398,43 @@ impl TravelSpec {
             if let Some(um) = self.length(field.id)
                 && um != (field.get)(&record)
             {
-                (field.set)(&mut record, um).with_context(|| field.name)?;
+                field.set(&mut record, um)?;
             }
         }
         Ok(record)
     }
 
-    /// Checks without a keyboard. Sensitivity values only have to fit one of
-    /// the step sizes a key can use (which one it uses is known at apply);
-    /// one that needs a finer step than 0.01 mm gets a note.
-    pub fn check_offline(&self) -> Result<Option<String>> {
-        let Err(err) = self.apply_to(TravelRecord::stock(Step::Um10)) else {
-            return Ok(None);
-        };
-        let finer = [Step::Um5, Step::Um1]
-            .iter()
-            .any(|step| self.apply_to(TravelRecord::stock(*step)).is_ok());
-        let sets_sensitivity = FIELDS
-            .iter()
-            .any(|f| f.sensitivity && self.length(f.id).is_some());
-        if sets_sensitivity && finer {
-            return Ok(Some(
-                "press/release need a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one".into(),
-            ));
+    /// Checks without a keyboard: every value must fit a record, or the
+    /// entry is an error. What only the keyboard can settle comes back as
+    /// notes: a sensitivity that needs a finer step than 0.01 mm (which step
+    /// a key uses is known at apply), and a value outside what this tool
+    /// writes (apply passes only if the key already holds it).
+    pub fn check_offline(&self) -> Result<Vec<String>> {
+        let mut notes = Vec::new();
+        for field in &FIELDS {
+            let Some(um) = self.length(field.id) else {
+                continue;
+            };
+            let fits = |step| (field.store)(&mut TravelRecord::stock(step), um);
+            if let Err(err) = fits(Step::Um10) {
+                if !field.sensitivity
+                    || [Step::Um5, Step::Um1].into_iter().all(|s| fits(s).is_err())
+                {
+                    return Err(err.context(field.name));
+                }
+                notes.push(format!(
+                    "{} needs a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one",
+                    field.name
+                ));
+            }
+            if !field.writable.contains(&um) {
+                notes.push(format!(
+                    "{}; apply passes only if the keyboard already holds it",
+                    field.outside_writable(um)
+                ));
+            }
         }
-        Err(err)
+        Ok(notes)
     }
 
     pub fn parse(value: &toml::Value, source: &str) -> Result<Self> {
@@ -455,6 +488,10 @@ mod tests {
         TravelRecord(bytes)
     }
 
+    fn set(record: &mut TravelRecord, id: FieldId, um: u32) -> Result<()> {
+        FIELDS[id as usize].set(record, um)
+    }
+
     /// Records from a real Air60 HE export: switch 2 (Jade Pro), 1.50 mm
     /// normal and 0.50 mm Rapid Trigger with 0.01 mm sensitivity.
     #[test]
@@ -474,8 +511,8 @@ mod tests {
     #[test]
     fn setters_keep_other_bits() {
         let mut r = record([0xa2, 0x21, 0x95, 0xe0, 0x09, 0x06, 0x00, 0x00]);
-        r.set_actuation_um(2000).unwrap();
-        r.set_press_um(100).unwrap();
+        set(&mut r, FieldId::Actuation, 2000).unwrap();
+        set(&mut r, FieldId::Press, 100).unwrap();
         r.set_trigger(Trigger::Continuous);
         assert_eq!(r.0[0], 0xa2);
         assert_eq!(r.0[1], 0x22);
@@ -483,21 +520,29 @@ mod tests {
         assert_eq!(r.actuation_um(), 2000);
         assert_eq!(r.press_um(), 100);
         assert_eq!(r.upper_deadzone_um(), 40);
-        r.set_upper_deadzone_um(0).unwrap();
+        set(&mut r, FieldId::UpperDeadzone, 0).unwrap();
         assert_eq!(r.upper_deadzone_um(), 0);
         assert_eq!(r.press_um(), 100);
-        assert!(r.set_actuation_um(50).is_err());
-        assert!(r.set_actuation_um(3400).is_err());
-        assert!(r.set_actuation_um(1234).is_err());
-        assert!(r.set_lower_deadzone_um(1300).is_err());
+        for (id, um) in [
+            (FieldId::Actuation, 50),
+            (FieldId::Actuation, 3400),
+            (FieldId::Actuation, 1234),
+            (FieldId::LowerDeadzone, 1300),
+            (FieldId::LowerDeadzone, 10),
+        ] {
+            assert!(set(&mut r, id, um).is_err(), "{id:?} {um}");
+        }
     }
 
     #[test]
     fn finer_steps() {
         let mut r = record([0x02, 0, 0x95, 0x04, 0, 0, 0, 0]);
-        r.set_press_um(105).unwrap();
+        set(&mut r, FieldId::Press, 105).unwrap();
         assert_eq!(r.press_um(), 105);
-        assert!(r.set_press_um(600).is_err(), "599 steps do not fit 9 bits");
+        assert!(
+            set(&mut r, FieldId::Press, 600).is_err(),
+            "599 steps do not fit 9 bits"
+        );
     }
 
     #[test]
@@ -525,7 +570,7 @@ mod tests {
         assert_eq!(r.press_um(), 4010);
         let spec = TravelSpec::of(&r);
         assert_eq!(spec.apply_to(r).unwrap(), r);
-        r.set_actuation_um(1000).unwrap();
+        set(&mut r, FieldId::Actuation, 1000).unwrap();
         assert!(
             TravelSpec {
                 lengths: [None, Some(4020), None, None, None],
@@ -538,24 +583,42 @@ mod tests {
 
     #[test]
     fn offline_checks() {
-        let spec = |press| TravelSpec {
-            lengths: [None, Some(press), None, None, None],
-            ..Default::default()
+        let spec = |id: FieldId, um| {
+            let mut lengths = [None; 5];
+            lengths[id as usize] = Some(um);
+            TravelSpec {
+                lengths,
+                ..Default::default()
+            }
         };
-        assert_eq!(spec(100).check_offline().unwrap(), None);
         assert!(
-            spec(105)
+            spec(FieldId::Press, 100)
                 .check_offline()
                 .unwrap()
-                .unwrap()
-                .contains("finer")
+                .is_empty()
         );
-        assert!(spec(3).check_offline().unwrap().is_some());
-        let too_far = TravelSpec {
-            lengths: [Some(3500), None, None, None, None],
-            ..Default::default()
-        };
-        assert!(too_far.check_offline().is_err());
+        let finer = spec(FieldId::Press, 105).check_offline().unwrap();
+        assert!(finer.len() == 1 && finer[0].contains("finer"), "{finer:?}");
+        assert_eq!(spec(FieldId::Press, 3).check_offline().unwrap().len(), 1);
+
+        // Values the keyboard can hold but this tool does not write are
+        // notes: an export of such a keyboard still checks and applies.
+        for (id, um) in [(FieldId::Actuation, 3500), (FieldId::Press, 4010)] {
+            let notes = spec(id, um).check_offline().unwrap();
+            assert!(
+                notes.len() == 1 && notes[0].contains("already holds"),
+                "{notes:?}"
+            );
+        }
+        for (id, um) in [
+            (FieldId::Actuation, 5130),
+            (FieldId::Actuation, 1234),
+            (FieldId::Press, 5130),
+            (FieldId::UpperDeadzone, 1290),
+            (FieldId::UpperDeadzone, 10),
+        ] {
+            assert!(spec(id, um).check_offline().is_err(), "{id:?} {um}");
+        }
         assert_eq!(TravelRecord::stock(Step::Um1).press_um(), 1);
         assert_eq!(TravelRecord::stock(Step::Um5).release_um(), 5);
     }

@@ -5,6 +5,10 @@
 //! marker, naming the backup taken before the write, is created before the
 //! first packet and removed only after verification passes or a backup is
 //! restored. While it exists, `apply` and `export` refuse.
+//!
+//! A write that starts while the marker exists (a `restore-backup` after an
+//! interrupted write) leaves it alone: the backup it names was taken before
+//! the damage, the new one after.
 
 use crate::backup::default_backup_dir;
 use anyhow::{Context, Result, bail};
@@ -28,15 +32,24 @@ pub fn ensure_none() -> Result<()> {
     Ok(())
 }
 
-pub fn begin(backup: &Path) -> Result<()> {
-    begin_in(&default_backup_dir()?, backup)
+/// Mark a write in `dir` unfinished, unless an earlier one still is; returns
+/// the backup the marker names, which is the one to restore.
+pub fn begin_in(dir: &Path, backup: &Path) -> Result<PathBuf> {
+    if let Some(earlier) = unfinished_in(dir)? {
+        return Ok(earlier);
+    }
+    let path = dir.join(NAME);
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::write(&path, backup.display().to_string())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(backup.to_path_buf())
 }
 
 pub fn end() -> Result<()> {
     end_in(&default_backup_dir()?)
 }
 
-fn unfinished_in(dir: &Path) -> Result<Option<PathBuf>> {
+pub fn unfinished_in(dir: &Path) -> Result<Option<PathBuf>> {
     let path = dir.join(NAME);
     match std::fs::read_to_string(&path) {
         Ok(backup) => Ok(Some(PathBuf::from(backup.trim()))),
@@ -45,14 +58,7 @@ fn unfinished_in(dir: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-fn begin_in(dir: &Path, backup: &Path) -> Result<()> {
-    let path = dir.join(NAME);
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    std::fs::write(&path, backup.display().to_string())
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn end_in(dir: &Path) -> Result<()> {
+pub fn end_in(dir: &Path) -> Result<()> {
     let path = dir.join(NAME);
     match std::fs::remove_file(&path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -70,9 +76,16 @@ mod tests {
     fn marks_and_clears_an_unfinished_write() {
         let dir = std::env::temp_dir().join(format!("nuphyctl-pending-{}", std::process::id()));
         assert_eq!(unfinished_in(&dir).unwrap(), None);
-        let backup = Path::new("/state/he-20261101T000000Z.bin");
-        begin_in(&dir, backup).unwrap();
-        assert_eq!(unfinished_in(&dir).unwrap().as_deref(), Some(backup));
+        let first = Path::new("/state/he-20261101T000000Z.bin");
+        let second = Path::new("/state/he-20261101T000100Z.bin");
+        assert_eq!(begin_in(&dir, first).unwrap(), first);
+        assert_eq!(unfinished_in(&dir).unwrap().as_deref(), Some(first));
+        assert_eq!(
+            begin_in(&dir, second).unwrap(),
+            first,
+            "the earliest backup stays"
+        );
+        assert_eq!(unfinished_in(&dir).unwrap().as_deref(), Some(first));
         end_in(&dir).unwrap();
         assert_eq!(unfinished_in(&dir).unwrap(), None);
         end_in(&dir).unwrap();

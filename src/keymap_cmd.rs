@@ -1,12 +1,11 @@
 //! `nuphyctl keymap ...` command handlers.
 
-use crate::app::is_retryable_rgb_error;
 use crate::backup::{default_backup_dir, write_backup};
 use crate::cli::{
     DeviceSelector, KeymapApplyArgs, KeymapDumpArgs, KeymapExportArgs, KeymapInfoArgs,
     KeymapListArgs, KeymapResetArgs, KeymapResetMode, KeymapRestoreBackupArgs, KeymapSetArgs,
 };
-use crate::hid_transport::{clear_input_reports, open_selected_device};
+use crate::hid_transport::{clear_input_reports, is_retryable_hid_error, open_selected_device};
 use crate::keycodes::{KEYCODES, format_hex, keycode_name, parse_keycode};
 use crate::keymap::{
     AIR75_V3_POSITIONS, Assignment, Change, Geometry, Keymap, Layout, apply_changes,
@@ -119,7 +118,7 @@ fn with_keyboard<T>(
             },
             Err(err) => err,
         };
-        if !is_retryable_rgb_error(&err) || attempt >= CONNECT_MAX_ATTEMPTS {
+        if !is_retryable_hid_error(&err) || attempt >= CONNECT_MAX_ATTEMPTS {
             return Err(err);
         }
         eprintln!(

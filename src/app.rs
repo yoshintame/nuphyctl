@@ -6,7 +6,8 @@ use crate::cli::{
 use crate::color::{RgbColor, parse_hex_bytes};
 use crate::he;
 use crate::hid_transport::{
-    REPORT_LEN, clear_input_reports, list_devices, open_selected_device, send_report,
+    REPORT_LEN, clear_input_reports, is_retryable_hid_error, list_devices, open_selected_device,
+    send_report,
 };
 use crate::keymap_cmd;
 use crate::nuphy_protocol::{KeyboardProtocol, MainLightSettings, SessionKey, SideLightSettings};
@@ -16,15 +17,6 @@ use std::{thread, time::Duration};
 
 const RGB_SET_MAX_ATTEMPTS: usize = 4;
 const RGB_SET_RETRY_BASE_DELAY_MS: u64 = 120;
-
-const RETRYABLE_RGB_ERROR_PATTERNS: [&str; 6] = [
-    "no such device",
-    "protocol error",
-    "timeout waiting for hid response",
-    "hid read_timeout failed",
-    "no matching hid device found",
-    "short write",
-];
 
 #[derive(Clone, Copy)]
 struct MainLightCommand {
@@ -132,7 +124,7 @@ fn run_rgb_set(api: &HidApi, args: &RgbSetArgs) -> Result<()> {
                 return Ok(());
             }
             Err(err) => {
-                if !is_retryable_rgb_error(&err) || attempt == RGB_SET_MAX_ATTEMPTS {
+                if !is_retryable_hid_error(&err) || attempt == RGB_SET_MAX_ATTEMPTS {
                     return Err(err);
                 }
 
@@ -213,7 +205,7 @@ fn run_rgb_side(api: &HidApi, args: &RgbSideSetArgs) -> Result<()> {
                 return Ok(());
             }
             Err(err) => {
-                if !is_retryable_rgb_error(&err) || attempt == RGB_SET_MAX_ATTEMPTS {
+                if !is_retryable_hid_error(&err) || attempt == RGB_SET_MAX_ATTEMPTS {
                     return Err(err);
                 }
 
@@ -295,7 +287,7 @@ fn run_rgb_decorative(api: &HidApi, args: &RgbDecorativeSetArgs) -> Result<()> {
                 return Ok(());
             }
             Err(err) => {
-                if !is_retryable_rgb_error(&err) || attempt == RGB_SET_MAX_ATTEMPTS {
+                if !is_retryable_hid_error(&err) || attempt == RGB_SET_MAX_ATTEMPTS {
                     return Err(err);
                 }
 
@@ -353,15 +345,6 @@ fn run_raw_send(api: &HidApi, selector: &DeviceSelector, report_id: u8, hex: &st
 
     println!("sent raw report_id={} bytes={}", report_id, bytes.len());
     Ok(())
-}
-
-pub(crate) fn is_retryable_rgb_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let msg = cause.to_string().to_ascii_lowercase();
-        RETRYABLE_RGB_ERROR_PATTERNS
-            .iter()
-            .any(|pattern| msg.contains(pattern))
-    })
 }
 
 fn parse_effect_color(

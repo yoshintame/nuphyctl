@@ -67,6 +67,19 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn sets_macros(&self, mode: u8) -> bool {
+        self.macros.keys().any(|at| at.mode == mode)
+    }
+
+    /// `base`, a mode's 32 macros, with the ones this config sets in `mode`
+    /// in their place.
+    pub fn macros_over(&self, mode: u8, mut base: Vec<Macro>) -> Vec<Macro> {
+        for (at, m) in self.macros.iter().filter(|(at, _)| at.mode == mode) {
+            base[at.index] = m.clone();
+        }
+        base
+    }
+
     /// One line for `check`: what the file sets.
     pub fn summary(&self) -> String {
         let travel: usize = self
@@ -172,29 +185,27 @@ fn parse_travel(at: &str, entries: &toml::Table) -> Result<TravelSection> {
     Ok(section)
 }
 
-/// Offline checks: travel entries must fit a record, macros must fit their
-/// region. Returns notes about what only the keyboard can settle.
+/// Offline checks: travel entries must fit a record, and each mode's listed
+/// macros must fit its region on their own. `apply` keeps the keyboard's
+/// other macros next to them, so a mode that only fits here with its other
+/// slots empty can still fail there. Returns notes about what only the
+/// keyboard can settle.
 pub fn check_config(config: &Config) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     for (&mode, section) in &config.travel {
         for (at, spec) in section.entries(mode) {
-            if let Some(note) = spec.check_offline().with_context(|| at.clone())? {
-                notes.push(format!("{at}: {note}"));
-            }
+            let found = spec.check_offline().with_context(|| at.clone())?;
+            notes.extend(found.into_iter().map(|note| format!("{at}: {note}")));
         }
     }
-    for mode in 0..MODES {
-        let mut list = vec![Macro::default(); MACRO_COUNT];
-        for (at, m) in config.macros.iter().filter(|(at, _)| at.mode == mode) {
-            list[at.index] = m.clone();
-        }
-        encode_region(&list).with_context(|| format!("{}.macros", mode_label(mode)))?;
+    for mode in (0..MODES).filter(|&m| config.sets_macros(m)) {
+        encode_region(&config.macros_over(mode, vec![Macro::default(); MACRO_COUNT]))
+            .with_context(|| format!("{}.macros", mode_label(mode)))?;
     }
     for (at, a) in &config.actions {
-        if !a.may_assign() {
+        if let Some(why) = a.assign_refusal() {
             notes.push(format!(
-                "{at} = {a}: {}; apply passes only if the keyboard already holds it",
-                a.unmanaged_reason()
+                "{at} = {a}: {why}; apply passes only if the keyboard already holds it"
             ));
         }
         if let Some(target) = a.layer()
@@ -365,7 +376,12 @@ mod tests {
         let notes = check("[m1.travel]\n\"*\" = { press = 0.105 }").unwrap();
         assert_eq!(notes.len(), 1, "a \"*\" entry is checked once: {notes:?}");
         assert!(notes[0].contains("finer"));
-        assert!(check("[m1.travel]\nW = { actuation = 3.5 }").is_err());
+        let held = check("[m1.travel]\nW = { actuation = 3.5 }").unwrap();
+        assert!(
+            held.len() == 1 && held[0].contains("already holds"),
+            "{held:?}"
+        );
+        assert!(check("[m1.travel]\nW = { actuation = 5.2 }").is_err());
         assert!(parse_config("[m1.travel]\nW = { press = 0.0013 }").is_err());
     }
 
@@ -374,11 +390,16 @@ mod tests {
         let factory = blank_state();
         let mut state = plan_changes(&parse_config(SAMPLE).unwrap(), &factory)
             .unwrap()
-            .want;
+            .want()
+            .clone();
         let one = TravelRef { mode: 0, slot: 1 };
         let mut odd = state.travel.record(one);
         odd.set_trigger(Trigger::Raw(3));
         state.travel.set_record(one, odd);
+        let two = TravelRef { mode: 0, slot: 2 };
+        let mut far = state.travel.record(two);
+        far.0[2..4].copy_from_slice(&400u16.to_le_bytes());
+        state.travel.set_record(two, far);
         state.matrix.set_action(
             KeyRef {
                 mode: 0,
@@ -419,7 +440,14 @@ mod tests {
         assert!(text.contains("ESC = \"0xf0ff0c\""), "{text}");
         assert!(text.contains("[m2.fn5]\nESC = \"TAB\""), "{text}");
 
+        assert!(text.contains("\"2\" = { actuation = 4.01 }"), "{text}");
+
         let config = parse_config(&text).unwrap();
+        let notes = check_config(&config).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("already holds")),
+            "{notes:?}"
+        );
         assert!(plan_changes(&config, &state).unwrap().is_empty());
     }
 

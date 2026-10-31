@@ -24,6 +24,9 @@ const FN_LAYER: u8 = 0xff;
 const MACRO_TAIL: u8 = 0xff;
 const FIRMWARE_LOADER: u8 = 0x07;
 const FACTORY_RESET: u8 = 0x08;
+const LINKED_REFUSAL: &str =
+    "it points into a DKS, Toggle, Mod-Tap or Snap Tap table this tool does not edit";
+const UNKNOWN_REFUSAL: &str = "this tool does not know what it does";
 
 /// The three bytes of a matrix slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,31 +157,29 @@ impl Action {
         }
     }
 
-    /// Whether `apply` may put this action on a key.
-    pub fn may_assign(self) -> bool {
+    /// Why `apply` may not put this action on a key, if it may not.
+    pub fn assign_refusal(self) -> Option<&'static str> {
         match self.kind() {
-            ActionKind::Function(code) => function(code).is_some_and(|f| f.assignable),
-            ActionKind::Linked(_) | ActionKind::Unknown(_) => false,
-            _ => true,
+            ActionKind::Function(code) if !function(code).is_some_and(|f| f.assignable) => {
+                Some("this tool does not assign this keyboard function")
+            }
+            ActionKind::Linked(_) => Some(LINKED_REFUSAL),
+            ActionKind::Unknown(_) => Some(UNKNOWN_REFUSAL),
+            _ => None,
         }
     }
 
-    /// Whether `apply` may replace this action with another: everything but
-    /// actions that point into tables this tool does not edit, or whose
-    /// meaning it does not know.
-    pub fn may_replace(self) -> bool {
-        !matches!(self.kind(), ActionKind::Linked(_) | ActionKind::Unknown(_))
-    }
-
-    /// Why `apply` leaves this action alone, for messages.
-    pub fn unmanaged_reason(self) -> &'static str {
+    /// Why `apply` may not replace this action with another, if it may not:
+    /// actions that point into tables this tool does not edit, whose meaning
+    /// it does not know, or that `restore-backup` could never put back.
+    pub fn replace_refusal(self) -> Option<&'static str> {
+        if self.never_write() {
+            return Some("no command writes it, so restore-backup could not put it back");
+        }
         match self.kind() {
-            ActionKind::Linked(_) => {
-                "it points into a DKS, Toggle, Mod-Tap or Snap Tap table this tool does not edit"
-            }
-            ActionKind::Unknown(_) => "this tool does not know what it does",
-            ActionKind::Function(_) => "this tool does not assign this keyboard function",
-            _ => "",
+            ActionKind::Linked(_) => Some(LINKED_REFUSAL),
+            ActionKind::Unknown(_) => Some(UNKNOWN_REFUSAL),
+            _ => None,
         }
     }
 
@@ -197,7 +198,8 @@ impl Action {
         }
     }
 
-    fn raw(self) -> String {
+    /// The raw literal `0xKKAABB`, as configs accept it.
+    pub fn raw(self) -> String {
         let [k, a, b] = self.0;
         format!("0x{k:02x}{a:02x}{b:02x}")
     }
@@ -286,6 +288,7 @@ impl std::str::FromStr for Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::he::region::{Region, matrix_offset};
 
     fn a(bytes: [u8; 3]) -> Action {
         Action(bytes)
@@ -358,12 +361,14 @@ mod tests {
             [0xf0, 0x52, 0],
             [0x70, 0, 0xff],
         ] {
-            assert!(a(ok).may_assign() && a(ok).may_replace(), "{ok:02x?}");
+            assert_eq!(a(ok).assign_refusal(), None, "{ok:02x?}");
+            assert_eq!(a(ok).replace_refusal(), None, "{ok:02x?}");
         }
         // Factory Fn layers hold functions this tool does not assign; a key
         // holding one can still be given something else.
         for f in [[0xf0, 0xfe, 0], [0xf0, 0x04, 0], [0xf0, 0x99, 0]] {
-            assert!(!a(f).may_assign() && a(f).may_replace(), "{f:02x?}");
+            assert!(a(f).assign_refusal().is_some(), "{f:02x?}");
+            assert_eq!(a(f).replace_refusal(), None, "{f:02x?}");
         }
         for unmanaged in [
             [0x95, 0, 0x20],
@@ -372,17 +377,44 @@ mod tests {
             [0x70, 32, 0xff],
             [0xf0, 0xff, 12],
             [0xf0, 0x52, 7],
+            [0xf0, 0x07, 0],
+            [0xf0, 0x08, 0],
+            [0xf0, 0x08, 5],
         ] {
             assert!(
-                !a(unmanaged).may_assign() && !a(unmanaged).may_replace(),
+                a(unmanaged).assign_refusal().is_some() && a(unmanaged).replace_refusal().is_some(),
                 "{unmanaged:02x?}"
             );
-            assert!(!a(unmanaged).unmanaged_reason().is_empty());
         }
+        assert!(
+            a([0xf0, 0x08, 0])
+                .replace_refusal()
+                .unwrap()
+                .contains("restore-backup")
+        );
         assert!(a([0xf0, 0x07, 0]).never_write());
         assert!(a([0xf0, 0x08, 5]).never_write());
         assert!(!a([0xf0, 0x52, 0]).never_write());
         assert_eq!(a([0xf0, 0xff, 9]).layer(), Some(9));
         assert_eq!(a([0x10, 0, 4]).layer(), None);
+    }
+
+    /// Whatever `apply` may replace, `restore-backup` may write back.
+    #[test]
+    fn replaceable_actions_can_be_restored() {
+        let at = matrix_offset(0, 1, 5) as u16;
+        for kind in [0x00, 0x10, 0x30, 0x70, 0x90, 0x95, 0xf0, 0xff] {
+            for x in 0..=255u8 {
+                for y in 0..=255u8 {
+                    let action = a([kind, x, y]);
+                    if action.replace_refusal().is_none() {
+                        assert!(
+                            Region::Matrix.check_write(at, &action.0).is_ok(),
+                            "{action}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

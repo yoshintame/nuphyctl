@@ -1,9 +1,9 @@
 //! `nuphyctl he ...` command handlers.
 
-use crate::app::is_retryable_rgb_error;
 use crate::backup::{default_backup_dir, write_backup};
 use crate::cli::{
-    DeviceSelector, HeCheckArgs, HeDumpArgs, HeExportArgs, HeInfoArgs, HeReadArgs, HeWriteArgs,
+    DeviceSelector, HeApplyArgs, HeCheckArgs, HeDumpArgs, HeExportArgs, HeInfoArgs, HeReadArgs,
+    HeRestoreArgs, HeWriteArgs,
 };
 use crate::he::actions::Action;
 use crate::he::config::{check_config, export_config, load_config};
@@ -11,23 +11,20 @@ use crate::he::layout::{KeyRef, TravelRef, key_count, layer_name, mode_label, po
 use crate::he::pending;
 use crate::he::plan::{Plan, plan_changes, plan_restore};
 use crate::he::protocol::{Base, FirmwareInfo, HeProtocol};
-use crate::he::region::{LAYERS_PER_MODE, MODES, Region};
+use crate::he::region::{LAYERS_PER_MODE, MODES, Region, WriteChunk};
 use crate::he::snapshot::{self, Identity};
-use crate::he::state::{Matrix, State, TravelTable};
+use crate::he::state::{MacroBank, Matrix, State, TravelTable};
 use crate::he::travel::{FIELDS, mm};
-use crate::hid_transport::{clear_input_reports, open_selected_device};
+use crate::hid_transport::connect_with_retry;
 use crate::output::print_json;
 use anyhow::{Context, Result, bail};
-use hidapi::{HidApi, HidDevice};
+use hidapi::HidApi;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::{thread, time::Duration};
 
 const NUPHY_VID: u16 = 0x19f5;
 /// The board whose slot layout `layout::AIR60_HE` describes.
 const AIR60_HE_PID: u16 = 0xfee0;
-const CONNECT_MAX_ATTEMPTS: usize = 4;
-const CONNECT_RETRY_BASE_DELAY_MS: u64 = 120;
 
 struct Keyboard<'a> {
     protocol: HeProtocol<'a>,
@@ -45,75 +42,79 @@ impl Keyboard<'_> {
         }
     }
 
+    fn matrix(&self) -> Result<Matrix> {
+        Matrix::from_bytes(self.protocol.read_region(Region::Matrix)?)
+    }
+
+    fn travel(&self) -> Result<TravelTable> {
+        TravelTable::from_bytes(self.protocol.read_region(Region::Travel)?)
+    }
+
     fn state(&self) -> Result<State> {
-        let read = |r| self.protocol.read_region(r);
-        State::from_regions([
-            read(Region::Matrix)?,
-            read(Region::Travel)?,
-            read(Region::Macros)?,
-        ])
+        Ok(State {
+            matrix: self.matrix()?,
+            travel: self.travel()?,
+            macros: MacroBank::from_bytes(self.protocol.read_region(Region::Macros)?)?,
+        })
     }
 
     fn factory_matrix(&self) -> Result<Matrix> {
         Matrix::from_bytes(self.protocol.read_factory_matrix()?)
     }
 
-    /// Back up `current`, mark the write unfinished, send the plan's writes,
-    /// read everything back and require it to equal the wanted state.
-    fn write_and_verify(&self, current: &State, plan: &Plan) -> Result<PathBuf> {
-        let writes = plan.writes(current)?;
-        let backup = write_backup(
+    fn write(&self, plan: &Plan) -> Result<PathBuf> {
+        write_and_verify(
             &default_backup_dir()?,
-            "he",
-            &snapshot::encode(self.identity(), current),
+            self.identity(),
+            plan,
+            |region, chunk| self.protocol.write(region, chunk),
+            || self.state(),
         )
-        .context("failed to save a backup; nothing was written")?;
-        eprintln!("backup: {}", backup.display());
-        let restore_hint = || {
-            format!(
-                "restore with: nuphyctl he restore-backup {}",
-                backup.display()
-            )
-        };
-        pending::begin(&backup)?;
-        for (region, chunk) in &writes {
-            self.protocol
-                .write(*region, chunk)
-                .with_context(|| format!("write failed; {}", restore_hint()))?;
-        }
-        let after = self.state().context("failed to read the keyboard back")?;
-        if after != plan.want {
-            bail!(
-                "verification failed: the keyboard does not hold what was written; {}",
-                restore_hint()
-            );
-        }
-        pending::end()?;
-        Ok(backup)
     }
 }
 
-fn connect(api: &HidApi, selector: &DeviceSelector) -> Result<HidDevice> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let err = match open_selected_device(api, selector) {
-            Ok(dev) => match clear_input_reports(&dev) {
-                Ok(()) => return Ok(dev),
-                Err(err) => err,
-            },
-            Err(err) => err,
-        };
-        if !is_retryable_rgb_error(&err) || attempt >= CONNECT_MAX_ATTEMPTS {
-            return Err(err);
-        }
+/// Back up the plan's current state into `dir`, mark the write unfinished,
+/// `send` the plan's writes, `read_back` everything and require it to equal
+/// the wanted state. Returns the new backup; on failure the error names the
+/// backup to restore, which is an earlier one if an earlier write is still
+/// unfinished.
+fn write_and_verify(
+    dir: &Path,
+    identity: Identity,
+    plan: &Plan,
+    mut send: impl FnMut(Region, &WriteChunk) -> Result<()>,
+    read_back: impl FnOnce() -> Result<State>,
+) -> Result<PathBuf> {
+    identity.firmware.check_writes()?;
+    let backup = write_backup(dir, "he", &snapshot::encode(identity, plan.current()))
+        .context("failed to save a backup; nothing was written")?;
+    eprintln!("backup: {}", backup.display());
+    let restore = pending::begin_in(dir, &backup)?;
+    if restore != backup {
         eprintln!(
-            "transient HID error (attempt {attempt}/{CONNECT_MAX_ATTEMPTS}): {err} -- retrying"
+            "note: an earlier write is still unfinished; restore its backup {} if this one fails too",
+            restore.display()
         );
-        thread::sleep(Duration::from_millis(
-            CONNECT_RETRY_BASE_DELAY_MS * attempt as u64,
-        ));
     }
+    let restore_hint = || {
+        format!(
+            "restore with: nuphyctl he restore-backup {}",
+            restore.display()
+        )
+    };
+    for (region, chunk) in plan.writes() {
+        send(*region, chunk).with_context(|| format!("write failed; {}", restore_hint()))?;
+    }
+    let after = read_back()
+        .with_context(|| format!("failed to read the keyboard back; {}", restore_hint()))?;
+    if &after != plan.want() {
+        bail!(
+            "verification failed: the keyboard does not hold what was written; {}",
+            restore_hint()
+        );
+    }
+    pending::end_in(dir)?;
+    Ok(backup)
 }
 
 fn with_keyboard<T>(
@@ -133,7 +134,7 @@ fn with_keyboard<T>(
         pid: Some(AIR60_HE_PID),
         ..selector.clone()
     };
-    let dev = connect(api, &selector)?;
+    let dev = connect_with_retry(api, &selector)?;
     let protocol = HeProtocol::new(&dev);
     let firmware = protocol.firmware_info()?;
     let base = protocol.base(&firmware)?;
@@ -196,7 +197,7 @@ pub fn run_dump(api: &HidApi, args: &HeDumpArgs) -> Result<()> {
     warn_if_unfinished()?;
     let read = &args.read;
     with_keyboard(api, &read.device, |kb| {
-        let matrix = Matrix::from_bytes(kb.protocol.read_region(Region::Matrix)?)?;
+        let matrix = kb.matrix()?;
         let factory = kb.factory_matrix()?;
         let mut layers = Vec::new();
         for mode in modes(read.mode) {
@@ -235,7 +236,7 @@ pub fn run_dump(api: &HidApi, args: &HeDumpArgs) -> Result<()> {
                                 "slot": r.at.slot,
                                 "position": position_name(r.at.slot),
                                 "action": r.now.to_string(),
-                                "raw": format!("{:02x}{:02x}{:02x}", r.now.0[0], r.now.0[1], r.now.0[2]),
+                                "raw": r.now.raw(),
                                 "factory": r.factory.to_string(),
                             })
                         })
@@ -263,7 +264,7 @@ pub fn run_dump(api: &HidApi, args: &HeDumpArgs) -> Result<()> {
 pub fn run_travel(api: &HidApi, args: &HeReadArgs) -> Result<()> {
     warn_if_unfinished()?;
     with_keyboard(api, &args.device, |kb| {
-        let table = TravelTable::from_bytes(kb.protocol.read_region(Region::Travel)?)?;
+        let table = kb.travel()?;
         let rows: Vec<TravelRef> = modes(args.mode)
             .into_iter()
             .flat_map(|mode| (0..key_count()).map(move |slot| TravelRef { mode, slot }))
@@ -279,7 +280,7 @@ pub fn run_travel(api: &HidApi, args: &HeReadArgs) -> Result<()> {
                         "position": position_name(at.slot),
                         "switch": r.switch_type(),
                         "trigger": r.trigger().to_string(),
-                        "raw": r.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "raw": r.hex(),
                     });
                     for field in &FIELDS {
                         entry[field.name] = json!(f64::from((field.get)(&r)) / 1000.0);
@@ -330,46 +331,45 @@ pub fn run_check(args: &HeCheckArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run_apply(api: &HidApi, args: &HeWriteArgs) -> Result<()> {
+pub fn run_apply(api: &HidApi, args: &HeApplyArgs) -> Result<()> {
     pending::ensure_none()?;
-    let config = load_config(&args.file)?;
-    let notes =
-        check_config(&config).with_context(|| format!("invalid config {}", args.file.display()))?;
-    with_keyboard(api, &args.device, |kb| {
-        let current = kb.state()?;
-        let mut plan = plan_changes(&config, &current)?;
-        plan.notes.extend(notes);
-        finish(kb, args, &current, &plan)
+    let config = load_config(&args.config)?;
+    let notes = check_config(&config)
+        .with_context(|| format!("invalid config {}", args.config.display()))?;
+    with_keyboard(api, &args.write.device, |kb| {
+        let mut plan = plan_changes(&config, &kb.state()?)?;
+        plan.add_notes(notes);
+        finish(kb, &args.write, &args.config, &plan)
     })
 }
 
-pub fn run_restore_backup(api: &HidApi, args: &HeWriteArgs) -> Result<()> {
-    let bytes = std::fs::read(&args.file)
-        .with_context(|| format!("failed to read {}", args.file.display()))?;
+pub fn run_restore_backup(api: &HidApi, args: &HeRestoreArgs) -> Result<()> {
+    let file = &args.backup;
+    let bytes =
+        std::fs::read(file).with_context(|| format!("failed to read {}", file.display()))?;
     let (identity, saved) =
-        snapshot::decode(&bytes).with_context(|| format!("cannot use {}", args.file.display()))?;
-    with_keyboard(api, &args.device, |kb| {
+        snapshot::decode(&bytes).with_context(|| format!("cannot use {}", file.display()))?;
+    with_keyboard(api, &args.write.device, |kb| {
         let here = kb.identity();
         if (identity.vid, identity.pid) != (here.vid, here.pid) {
             bail!(
                 "{} is a backup of {:04x}:{:04x}, not of this {:04x}:{:04x}",
-                args.file.display(),
+                file.display(),
                 identity.vid,
                 identity.pid,
                 here.vid,
                 here.pid
             );
         }
-        let current = kb.state()?;
-        let mut plan = plan_restore(&current, &saved);
+        let mut plan = plan_restore(&kb.state()?, &saved)?;
         if identity.firmware != here.firmware {
-            plan.notes.push(format!(
+            plan.add_notes([format!(
                 "the backup was taken on firmware {}, the keyboard runs {}",
                 identity.firmware, here.firmware
-            ));
+            )]);
         }
-        finish(kb, args, &current, &plan)?;
-        if !args.dry_run {
+        finish(kb, &args.write, file, &plan)?;
+        if !args.write.dry_run {
             // The keyboard now holds the backup: any unfinished write is undone.
             pending::end()?;
         }
@@ -383,25 +383,25 @@ enum Outcome {
     Written(PathBuf),
 }
 
-/// Validate the plan's writes and the firmware in every case, so a dry run
-/// fails exactly where a real run would; then write unless it is a dry run.
-fn finish(kb: &Keyboard, args: &HeWriteArgs, current: &State, plan: &Plan) -> Result<()> {
+/// The plan's writes were checked when it was made; check the firmware in
+/// every case too, so a dry run fails exactly where a real run would; then
+/// write unless it is a dry run.
+fn finish(kb: &Keyboard, args: &HeWriteArgs, file: &Path, plan: &Plan) -> Result<()> {
     if !plan.is_empty() {
         kb.firmware.version.check_writes()?;
-        plan.writes(current)?;
     }
     let outcome = if plan.is_empty() {
         Outcome::NoChanges
     } else if args.dry_run {
         Outcome::DryRun
     } else {
-        Outcome::Written(kb.write_and_verify(current, plan)?)
+        Outcome::Written(kb.write(plan)?)
     };
-    report(args.json, &args.file, plan, &outcome)
+    report(args.json, file, plan, &outcome)
 }
 
 fn report(as_json: bool, file: &Path, plan: &Plan, outcome: &Outcome) -> Result<()> {
-    let changes: Vec<String> = plan.changes.iter().map(ToString::to_string).collect();
+    let changes: Vec<String> = plan.changes().iter().map(ToString::to_string).collect();
     if as_json {
         let (status, backup) = match outcome {
             Outcome::NoChanges => ("no_changes", None),
@@ -412,11 +412,11 @@ fn report(as_json: bool, file: &Path, plan: &Plan, outcome: &Outcome) -> Result<
             "file": file.display().to_string(),
             "status": status,
             "changes": changes,
-            "notes": plan.notes,
+            "notes": plan.notes(),
             "backup": backup,
         }));
     }
-    for note in &plan.notes {
+    for note in plan.notes() {
         eprintln!("note: {note}");
     }
     for line in &changes {
@@ -433,4 +433,114 @@ fn report(as_json: bool, file: &Path, plan: &Plan, outcome: &Outcome) -> Result<
         Outcome::Written(_) => println!("{} change(s) written and verified", changes.len()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::he::config::parse_config;
+    use crate::he::protocol::FirmwareVersion;
+    use crate::he::testutil::{SAMPLE, blank_state};
+    use std::cell::{Cell, RefCell};
+
+    const ID: Identity = Identity {
+        vid: NUPHY_VID,
+        pid: AIR60_HE_PID,
+        firmware: FirmwareVersion::Bcd(0x120),
+    };
+
+    /// A keyboard in memory whose link drops once `budget` packets are sent.
+    struct FakeKeyboard {
+        state: RefCell<State>,
+        budget: Cell<usize>,
+    }
+
+    impl FakeKeyboard {
+        fn write(&self, dir: &Path, plan: &Plan) -> Result<PathBuf> {
+            write_and_verify(
+                dir,
+                ID,
+                plan,
+                |region, chunk| {
+                    let Some(left) = self.budget.get().checked_sub(1) else {
+                        bail!("link dropped");
+                    };
+                    self.budget.set(left);
+                    let at = usize::from(chunk.addr);
+                    self.state.borrow_mut().region_mut(region)[at..at + chunk.data.len()]
+                        .copy_from_slice(&chunk.data);
+                    Ok(())
+                },
+                || Ok(self.state.borrow().clone()),
+            )
+        }
+
+        fn now(&self) -> State {
+            self.state.borrow().clone()
+        }
+    }
+
+    fn saved(path: &Path) -> State {
+        snapshot::decode(&std::fs::read(path).unwrap()).unwrap().1
+    }
+
+    /// An apply stops half way, then the restore it points to stops half way
+    /// too: the marker and every hint keep naming the backup taken before
+    /// the damage, and restoring that one brings the keyboard back.
+    #[test]
+    fn an_interrupted_restore_keeps_the_first_backup() {
+        let dir = std::env::temp_dir().join(format!("nuphyctl-chain-{}", std::process::id()));
+        let good = blank_state();
+        let kb = FakeKeyboard {
+            state: RefCell::new(good.clone()),
+            budget: Cell::new(0),
+        };
+        let apply = plan_changes(&parse_config(SAMPLE).unwrap(), &good).unwrap();
+        assert!(apply.writes().len() >= 3, "{:?}", apply.writes());
+        kb.budget.set(apply.writes().len() - 1);
+        let err = format!("{:#}", kb.write(&dir, &apply).unwrap_err());
+        let first = pending::unfinished_in(&dir).unwrap().unwrap();
+        assert!(err.contains(&first.display().to_string()), "{err}");
+        assert_eq!(saved(&first), good);
+
+        let restore = plan_restore(&kb.now(), &saved(&first)).unwrap();
+        assert!(restore.writes().len() >= 2, "{:?}", restore.writes());
+        kb.budget.set(1);
+        let err = format!("{:#}", kb.write(&dir, &restore).unwrap_err());
+        assert!(err.contains(&first.display().to_string()), "{err}");
+        assert_eq!(pending::unfinished_in(&dir).unwrap(), Some(first.clone()));
+
+        kb.budget.set(usize::MAX);
+        let restore = plan_restore(&kb.now(), &saved(&first)).unwrap();
+        kb.write(&dir, &restore).unwrap();
+        assert_eq!(kb.now(), good);
+        assert_eq!(pending::unfinished_in(&dir).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_unchecked_firmware_before_anything() {
+        let dir = std::env::temp_dir().join(format!("nuphyctl-firmware-{}", std::process::id()));
+        let good = blank_state();
+        let plan = plan_changes(&parse_config(SAMPLE).unwrap(), &good).unwrap();
+        let old = Identity {
+            firmware: FirmwareVersion::Bcd(0x105),
+            ..ID
+        };
+        let sent = Cell::new(0);
+        let err = write_and_verify(
+            &dir,
+            old,
+            &plan,
+            |_, _| {
+                sent.set(sent.get() + 1);
+                Ok(())
+            },
+            || Ok(good.clone()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("firmware"), "{err}");
+        assert_eq!(sent.get(), 0);
+        assert!(!dir.exists(), "no backup, no marker");
+    }
 }

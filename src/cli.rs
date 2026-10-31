@@ -494,9 +494,9 @@ pub enum HeSubcommand {
     /// Validate a TOML file without a keyboard
     Check(HeCheckArgs),
     /// Apply a declarative TOML file (only listed keys and fields are touched)
-    Apply(HeWriteArgs),
+    Apply(HeApplyArgs),
     /// Write an `he` backup back to the keyboard (only differing entries)
-    RestoreBackup(HeWriteArgs),
+    RestoreBackup(HeRestoreArgs),
 }
 
 #[derive(Args, Debug)]
@@ -554,12 +554,27 @@ pub struct HeCheckArgs {
     pub file: PathBuf,
 }
 
-/// Arguments of the commands that write: `apply` and `restore-backup`.
+#[derive(Args, Debug)]
+pub struct HeApplyArgs {
+    /// TOML config file
+    pub config: PathBuf,
+
+    #[command(flatten)]
+    pub write: HeWriteArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct HeRestoreArgs {
+    /// Backup file written by `he apply` or `he restore-backup`
+    pub backup: PathBuf,
+
+    #[command(flatten)]
+    pub write: HeWriteArgs,
+}
+
+/// Options shared by the commands that write: `apply` and `restore-backup`.
 #[derive(Args, Debug)]
 pub struct HeWriteArgs {
-    /// TOML config (`apply`) or backup file (`restore-backup`)
-    pub file: PathBuf,
-
     /// Show the changes without writing
     #[arg(long)]
     pub dry_run: bool,

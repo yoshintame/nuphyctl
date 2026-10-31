@@ -2,9 +2,21 @@ use crate::cli::DeviceSelector;
 use anyhow::{Context, Result, anyhow, bail};
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use std::collections::BTreeSet;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const REPORT_LEN: usize = 64;
+const CONNECT_MAX_ATTEMPTS: usize = 4;
+const CONNECT_RETRY_BASE_DELAY_MS: u64 = 120;
+
+const RETRYABLE_HID_ERROR_PATTERNS: [&str; 6] = [
+    "no such device",
+    "protocol error",
+    "timeout waiting for hid response",
+    "hid read_timeout failed",
+    "no matching hid device found",
+    "short write",
+];
 pub type Report = [u8; REPORT_LEN];
 
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +197,40 @@ pub fn open_selected_device(api: &HidApi, selector: &DeviceSelector) -> Result<H
             )
         }
     }
+}
+
+/// Open the selected device and drain stale input reports, retrying while
+/// the error looks transient.
+pub fn connect_with_retry(api: &HidApi, selector: &DeviceSelector) -> Result<HidDevice> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let err = match open_selected_device(api, selector) {
+            Ok(dev) => match clear_input_reports(&dev) {
+                Ok(()) => return Ok(dev),
+                Err(err) => err,
+            },
+            Err(err) => err,
+        };
+        if !is_retryable_hid_error(&err) || attempt >= CONNECT_MAX_ATTEMPTS {
+            return Err(err);
+        }
+        eprintln!(
+            "transient HID error (attempt {attempt}/{CONNECT_MAX_ATTEMPTS}): {err} -- retrying"
+        );
+        thread::sleep(Duration::from_millis(
+            CONNECT_RETRY_BASE_DELAY_MS * attempt as u64,
+        ));
+    }
+}
+
+pub(crate) fn is_retryable_hid_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let msg = cause.to_string().to_ascii_lowercase();
+        RETRYABLE_HID_ERROR_PATTERNS
+            .iter()
+            .any(|pattern| msg.contains(pattern))
+    })
 }
 
 pub fn send_report(dev: &HidDevice, report_id: u8, data: &[u8]) -> Result<()> {

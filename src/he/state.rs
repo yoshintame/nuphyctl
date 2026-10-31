@@ -207,13 +207,18 @@ impl fmt::Display for Change {
         match self {
             Self::Action { at, from, to } => write!(f, "{at}: {from} -> {to}"),
             Self::Travel { at, from, to } => {
-                let before = TravelSpec::of(from);
-                write!(
-                    f,
-                    "{at}: {} -> {}",
-                    before.render(None),
-                    TravelSpec::of(to).render(Some(&before))
-                )
+                let (before, after) = (TravelSpec::of(from), TravelSpec::of(to));
+                if before == after {
+                    // Only bits without a config field differ.
+                    write!(f, "{at}: raw {} -> {}", from.hex(), to.hex())
+                } else {
+                    write!(
+                        f,
+                        "{at}: {} -> {}",
+                        before.render(None),
+                        after.render(Some(&before))
+                    )
+                }
             }
             Self::Macro { at, from, to } => write!(f, "{at}: {} -> {}", show(from), show(to)),
             Self::MacroRegion { mode } => write!(
@@ -222,5 +227,25 @@ impl fmt::Display for Change {
                 mode_label(*mode)
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn travel_changes_show_what_differs() {
+        let at = TravelRef { mode: 2, slot: 16 };
+        let from = TravelRecord([0x02, 0, 0x95, 0, 0, 0, 0, 0]);
+        let mut to = from;
+        to.0[0] = 0xa2;
+        assert_eq!(
+            Change::Travel { at, from, to }.to_string(),
+            format!("{at}: raw 0200950000000000 -> a200950000000000")
+        );
+        to.0[2] = 0x77;
+        let text = Change::Travel { at, from, to }.to_string();
+        assert!(text.ends_with("-> { actuation = 1.2 }"), "{text}");
     }
 }

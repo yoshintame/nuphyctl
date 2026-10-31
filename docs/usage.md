@@ -257,13 +257,22 @@ Writes are deliberately narrow:
 
 - Only key actions, travel records and macro regions are written, and only the
   entries that differ (a changed mode's macros are re-laid out the way NuPhy IO
-  lays them out). The G-key bytes past the 128 matrix slots are never written.
+  lays them out). The bytes past the 128 matrix slots of each layer (384..511:
+  unused bytes, then the G keys from 464) are never written.
 - DKS, Mod-Tap, Toggle and Snap Tap keys, and kinds this tool does not know,
   are neither assigned nor replaced; change those in NuPhy IO. Keyboard
   functions it does not assign (mode switches, some lighting keys) can still
-  be replaced.
+  be replaced, except factory reset and the firmware loader.
 - Factory reset and the firmware loader are never put on a key, not even from a
-  backup, and no command outside the region reads and writes is ever sent.
+  backup, and no command outside the region reads and writes is ever sent. A
+  key holding one is therefore not replaced either, since a backup could not
+  put it back; where a backup holds one the keyboard no longer does,
+  `restore-backup` leaves that key as it is and says so.
+- Travel values the keyboard can hold but this tool does not write (actuation
+  outside 0.1..3.3 mm, press or release over 3.3 mm) are notes, not errors: an
+  export of such a keyboard checks and applies as long as the value stays.
+- `check` proves each mode's listed macros fit on their own; `apply` keeps the
+  keyboard's other macros next to them, so it can still run out of room.
 - Only the Air60 HE (`19f5:fee0`) is talked to: it is the one layout known.
 - `--dry-run` runs every check a real run does, so it fails where a write
   would.
@@ -273,7 +282,8 @@ Writes are deliberately narrow:
 - Until a write is verified, `$XDG_STATE_HOME/nuphyctl/he-pending` names its
   backup. While it exists, `apply` and `export` refuse: a write that stopped
   half way can leave macros that decode but are wrong. `restore-backup`
-  clears it.
+  clears it. A `restore-backup` that stops half way itself leaves the marker
+  naming the first backup, the one taken before the damage.
 
 Backups start with a header (format version, vendor and product id, firmware
 version). `restore-backup` refuses a backup of another board and notes a
