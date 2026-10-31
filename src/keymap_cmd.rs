@@ -133,7 +133,8 @@ fn with_keyboard<T>(
 
 fn backup_keymap(keymap: &Keymap) -> Result<PathBuf> {
     let dir = default_backup_dir()?;
-    write_backup(&dir, &keymap.bytes).context("failed to save keymap backup; nothing was written")
+    write_backup(&dir, "keymap", &keymap.bytes)
+        .context("failed to save keymap backup; nothing was written")
 }
 
 fn print_json(value: &Value) -> Result<()> {

@@ -195,6 +195,55 @@ Reset a mode's layers (or all layers) to the factory keymap. `--yes` is required
 nuphyctl keymap reset --mode windows --yes
 ```
 
+## Hall-effect boards
+
+The Air60 HE and its Hall-effect siblings speak a different protocol from the
+Air75 V3: no session key, and a key matrix of three modes (`m1`..`m3`, as NuPhy
+IO labels them) with four layers each (`base`, `fn1`, `fn2`, `fn3`), plus a
+per-key travel table per mode. These commands live under `he`; only the
+Air60 HE layout has named positions so far.
+
+```bash
+nuphyctl he info
+nuphyctl he dump --mode m1 --changed
+nuphyctl he travel --mode m2
+nuphyctl he export > air60he.toml
+nuphyctl he apply air60he.toml --dry-run
+nuphyctl he apply air60he.toml
+nuphyctl he restore-backup ~/.local/state/nuphyctl/he-<stamp>.bin
+```
+
+The config lists only what it changes; travel values are millimetres and unset
+fields keep the keyboard's value. `"*"` applies to every key of the mode and a
+key's own entry overrides it field by field:
+
+```toml
+[m1.base]
+CAPS = "FN(2)"            # momentary layer, absolute number (m1 = 0..3)
+
+[m1.fn2]
+I = "UP"
+S = "LSFT"
+M = "MACRO(0)"
+"#58" = "LCTL+C"
+
+[m1.travel]
+"*" = { actuation = 1.5, trigger = "normal" }
+W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
+```
+
+Actions are key names with optional modifiers (`LCTL+C`), media names (`VOLU`,
+`MUTE`), `FN(n)`, `MACRO(n)`, keyboard functions (`SLEEP`, `LIGHT_TOGGLE`) or
+raw `0xKKAABB`. Fields of a travel entry: `actuation`, `trigger` (`normal`,
+`rapid`, `continuous`), `press`, `release`, `upper_deadzone`, `lower_deadzone`.
+
+Writes are deliberately narrow. `apply` writes only key actions and travel
+records, refuses DKS, Mod-Tap, Toggle and Snap Tap keys (assign or remove those
+in NuPhy IO), never assigns factory reset or the firmware loader, and sends no
+command outside the read and write commands it needs. Before writing it saves
+the matrix and travel tables to `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`, and
+afterwards reads both back and fails unless they match.
+
 ## Device selection
 
 If more than one matching HID interface is present, narrow the target with one or more selector flags.

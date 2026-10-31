@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod color;
+mod he;
 mod hid_transport;
 mod keycodes;
 mod keymap;

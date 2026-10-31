@@ -768,8 +768,8 @@ pub fn default_backup_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/nuphyctl"))
 }
 
-/// Write a backup as `keymap-YYYYMMDDTHHMMSSZ.bin` and return its path.
-pub fn write_backup(dir: &Path, bytes: &[u8]) -> Result<PathBuf> {
+/// Write a backup as `<prefix>-YYYYMMDDTHHMMSSZ.bin` and return its path.
+pub fn write_backup(dir: &Path, prefix: &str, bytes: &[u8]) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create backup directory {}", dir.display()))?;
     let secs = SystemTime::now()
@@ -779,9 +779,9 @@ pub fn write_backup(dir: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let stamp = utc_timestamp(secs);
     for n in 0..1000 {
         let name = if n == 0 {
-            format!("keymap-{stamp}.bin")
+            format!("{prefix}-{stamp}.bin")
         } else {
-            format!("keymap-{stamp}-{n}.bin")
+            format!("{prefix}-{stamp}-{n}.bin")
         };
         let path = dir.join(name);
         match std::fs::OpenOptions::new()
@@ -1129,8 +1129,8 @@ mod tests {
     #[test]
     fn backups_never_overwrite() {
         let dir = std::env::temp_dir().join(format!("nuphyctl-test-{}", std::process::id()));
-        let a = write_backup(&dir, &[1, 2, 3]).unwrap();
-        let b = write_backup(&dir, &[4, 5, 6]).unwrap();
+        let a = write_backup(&dir, "keymap", &[1, 2, 3]).unwrap();
+        let b = write_backup(&dir, "keymap", &[4, 5, 6]).unwrap();
         assert_ne!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), vec![1, 2, 3]);
         assert_eq!(std::fs::read(&b).unwrap(), vec![4, 5, 6]);

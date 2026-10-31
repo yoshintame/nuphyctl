@@ -20,9 +20,11 @@ pub enum Command {
     Keymap(KeymapCommand),
     /// Send a raw HID output report
     Raw(RawCommand),
+    /// Hall-effect boards (Air60 HE and siblings): keymap and key travel
+    He(HeCommand),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct DeviceSelector {
     /// USB vendor ID (hex like 0x19f5 or decimal)
     #[arg(long, value_parser = parse_u16_any_base)]
@@ -468,6 +470,114 @@ pub struct RawSendArgs {
     /// HID report ID (NuPhy packets use 0)
     #[arg(long, default_value_t = 0)]
     pub report_id: u8,
+
+    #[command(flatten)]
+    pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeCommand {
+    #[command(subcommand)]
+    pub action: HeSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HeSubcommand {
+    /// Show firmware version and the current mode
+    Info(HeInfoArgs),
+    /// Print key actions per mode and layer
+    Dump(HeDumpArgs),
+    /// Print per-key travel: actuation point, Rapid Trigger, dead zones (mm)
+    Travel(HeTravelArgs),
+    /// Print changed actions and the travel table as an `apply` TOML file
+    Export(HeExportArgs),
+    /// Apply a declarative TOML file (only listed keys and fields are touched)
+    Apply(HeApplyArgs),
+    /// Write an `he` backup back to the keyboard (only differing entries)
+    RestoreBackup(HeRestoreBackupArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct HeInfoArgs {
+    /// Print JSON
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeDumpArgs {
+    /// Only this mode (m1, m2 or m3)
+    #[arg(long)]
+    pub mode: Option<String>,
+
+    /// Only keys that differ from the factory matrix
+    #[arg(long)]
+    pub changed: bool,
+
+    /// Print JSON
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeTravelArgs {
+    /// Only this mode (m1, m2 or m3)
+    #[arg(long)]
+    pub mode: Option<String>,
+
+    /// Print JSON
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeExportArgs {
+    /// Only this mode (m1, m2 or m3)
+    #[arg(long)]
+    pub mode: Option<String>,
+
+    #[command(flatten)]
+    pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeApplyArgs {
+    /// TOML file to apply
+    pub file: PathBuf,
+
+    /// Show the changes without writing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Print JSON
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub device: DeviceSelector,
+}
+
+#[derive(Args, Debug)]
+pub struct HeRestoreBackupArgs {
+    /// Backup file written by `he apply` (he-*.bin)
+    pub file: PathBuf,
+
+    /// Show the changes without writing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Print JSON
+    #[arg(long)]
+    pub json: bool,
 
     #[command(flatten)]
     pub device: DeviceSelector,
