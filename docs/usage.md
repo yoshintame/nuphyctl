@@ -253,6 +253,12 @@ raw `0xKKAABB`. Fields of a travel entry: `actuation`, `trigger` (`normal`,
 `rapid`, `continuous`, or a raw `0`..`15`), `press`, `release`,
 `upper_deadzone`, `lower_deadzone`.
 
+`MACRO(n)` plays the macro once per press. `MACRO(n, hold)` repeats it while
+the key is held, `MACRO(n, toggle)` until the key is pressed again (NuPhy IO's
+"Press key to stop"); stopping a toggle can cut the macro off half way and
+leave a modifier held until the keyboard is unplugged. NuPhy IO's "Set the
+loop times" counts do not play that many times on the Air60 HE and stay raw.
+
 Writes are deliberately narrow:
 
 - Only key actions, travel records and macro regions are written, and only the

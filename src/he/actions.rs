@@ -3,7 +3,11 @@
 //! - `10 mods usage`: a keyboard key, `mods` a modifier bitmask, `usage` a HID
 //!   keyboard usage (`10 02 00` is Left Shift alone, `10 01 06` Ctrl+C).
 //! - `30 lo hi`: a consumer-control usage (`30 e2 00` Mute).
-//! - `70 n ff`: macro slot `n`, shown 1-based as NuPhy IO does (`MACRO(1)`).
+//! - `70 n r`: macro slot `n`, shown 1-based as NuPhy IO does, with its loop
+//!   mode `r`: `01` plays once (`MACRO(1)`), `00` repeats while the key is
+//!   held (`MACRO(1, hold)`), `ff` repeats until the key is pressed again
+//!   (`MACRO(1, toggle)`, NuPhy IO's "Press key to stop"). Other values do
+//!   not play a matching number of times and stay raw.
 //! - `f0 ff n`: momentary layer `n` (absolute layer number, 0..=11).
 //! - `f0 f 00`: a keyboard function (lighting, sleep, mode switch, ...).
 //! - `90`..`95`: DKS, Toggle, Mod-Tap and Snap Tap keys, which point into
@@ -21,7 +25,9 @@ const KIND_MACRO: u8 = 0x70;
 const KIND_FUNCTION: u8 = 0xf0;
 const LINKED_KINDS: std::ops::RangeInclusive<u8> = 0x90..=0x95;
 const FN_LAYER: u8 = 0xff;
-const MACRO_TAIL: u8 = 0xff;
+const MACRO_ONCE: u8 = 0x01;
+const MACRO_HOLD: u8 = 0x00;
+const MACRO_TOGGLE: u8 = 0xff;
 const FIRMWARE_LOADER: u8 = 0x07;
 const FACTORY_RESET: u8 = 0x08;
 const LINKED_REFUSAL: &str =
@@ -41,8 +47,11 @@ pub enum ActionKind {
         usage: u8,
     },
     Consumer(u16),
-    /// A macro slot, 0-based.
-    Macro(u8),
+    /// A macro slot, 0-based, and how it loops.
+    Macro {
+        slot: u8,
+        mode: MacroMode,
+    },
     /// A momentary layer, absolute (0..=11).
     Layer(u8),
     /// A keyboard function by code, named or not.
@@ -51,6 +60,50 @@ pub enum ActionKind {
     Linked([u8; 3]),
     /// A kind this tool does not know (mouse, system, out-of-range slots, ...).
     Unknown([u8; 3]),
+}
+
+/// How a macro key plays its macro, checked on an Air60 HE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacroMode {
+    Once,
+    /// Repeats while the key is held.
+    Hold,
+    /// Repeats until the key is pressed again. Stopping it can cut a macro
+    /// off half way and leave a modifier held.
+    Toggle,
+}
+
+impl MacroMode {
+    const ALL: [Self; 3] = [Self::Once, Self::Hold, Self::Toggle];
+
+    fn byte(self) -> u8 {
+        match self {
+            Self::Once => MACRO_ONCE,
+            Self::Hold => MACRO_HOLD,
+            Self::Toggle => MACRO_TOGGLE,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.byte() == byte)
+    }
+
+    /// The name after the macro number; `MACRO(n)` alone plays once.
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Once => None,
+            Self::Hold => Some("hold"),
+            Self::Toggle => Some("toggle"),
+        }
+    }
+
+    fn parse(input: &str) -> Result<Self> {
+        let input = input.trim();
+        Self::ALL
+            .into_iter()
+            .find(|m| m.name().is_some_and(|n| n.eq_ignore_ascii_case(input)))
+            .with_context(|| format!("macro mode {input:?} is not hold or toggle"))
+    }
 }
 
 /// A keyboard function (`f0 code 00`).
@@ -147,8 +200,11 @@ impl Action {
             [KIND_KEY, 0, 0] => ActionKind::None,
             [KIND_KEY, mods, usage] => ActionKind::Key { mods, usage },
             [KIND_CONSUMER, lo, hi] => ActionKind::Consumer(u16::from_le_bytes([lo, hi])),
-            [KIND_MACRO, slot, MACRO_TAIL] if usize::from(slot) < MACRO_COUNT => {
-                ActionKind::Macro(slot)
+            [KIND_MACRO, slot, mode] if usize::from(slot) < MACRO_COUNT => {
+                match MacroMode::from_byte(mode) {
+                    Some(mode) => ActionKind::Macro { slot, mode },
+                    None => ActionKind::Unknown(self.0),
+                }
             }
             [KIND_FUNCTION, FN_LAYER, layer] if layer < LAYERS => ActionKind::Layer(layer),
             [KIND_FUNCTION, code, 0] if code != FN_LAYER => ActionKind::Function(code),
@@ -217,7 +273,13 @@ impl fmt::Display for Action {
                 Some((_, name)) => f.write_str(name),
                 None => write!(f, "CONSUMER(0x{usage:03x})"),
             },
-            ActionKind::Macro(slot) => write!(f, "MACRO({})", u16::from(slot) + 1),
+            ActionKind::Macro { slot, mode } => {
+                write!(f, "MACRO({}", u16::from(slot) + 1)?;
+                if let Some(name) = mode.name() {
+                    write!(f, ", {name}")?;
+                }
+                f.write_str(")")
+            }
             ActionKind::Layer(layer) => write!(f, "FN({layer})"),
             ActionKind::Function(code) => match function(code) {
                 Some(func) => f.write_str(func.name),
@@ -251,12 +313,16 @@ impl std::str::FromStr for Action {
             }
             return Ok(Self([KIND_FUNCTION, FN_LAYER, layer as u8]));
         }
-        if let Some(n) = call_args(s, "MACRO") {
+        if let Some(args) = call_args(s, "MACRO") {
+            let (n, mode) = match args.split_once(',') {
+                Some((n, mode)) => (n, MacroMode::parse(mode)?),
+                None => (args, MacroMode::Once),
+            };
             let number = parse_number(n)?;
             if !(1..=MACRO_COUNT as u32).contains(&number) {
                 bail!("macro number out of range in {s:?} (1..={MACRO_COUNT})");
             }
-            return Ok(Self([KIND_MACRO, (number - 1) as u8, MACRO_TAIL]));
+            return Ok(Self([KIND_MACRO, (number - 1) as u8, mode.byte()]));
         }
         if let Some(n) = call_args(s, "CONSUMER") {
             let usage = u16::try_from(parse_number(n)?)
@@ -304,7 +370,10 @@ mod tests {
         assert_eq!(a([0x10, 0, 0x65]).to_string(), "APP");
         assert_eq!(a([0x30, 0xe2, 0]).to_string(), "MUTE");
         assert_eq!(a([0x30, 0x9f, 0x02]).to_string(), "MISSION_CONTROL");
-        assert_eq!(a([0x70, 3, 0xff]).to_string(), "MACRO(4)");
+        assert_eq!(a([0x70, 3, 0x01]).to_string(), "MACRO(4)");
+        assert_eq!(a([0x70, 3, 0x00]).to_string(), "MACRO(4, hold)");
+        assert_eq!(a([0x70, 3, 0xff]).to_string(), "MACRO(4, toggle)");
+        assert_eq!(a([0x70, 3, 0x02]).to_string(), "0x700302");
         assert_eq!(a([0xf0, 0xff, 2]).to_string(), "FN(2)");
         assert_eq!(a([0xf0, 0x52, 0]).to_string(), "SLEEP");
         assert_eq!(a([0xf0, 0x08, 0]).to_string(), "FACTORY_RESET");
@@ -320,8 +389,13 @@ mod tests {
         assert_eq!("kc_lshift".parse::<Action>().unwrap(), a([0x10, 0x02, 0]));
         assert_eq!("VOLU".parse::<Action>().unwrap(), a([0x30, 0xe9, 0]));
         assert_eq!("FN(9)".parse::<Action>().unwrap(), a([0xf0, 0xff, 9]));
-        assert_eq!("macro(1)".parse::<Action>().unwrap(), a([0x70, 0, 0xff]));
-        assert_eq!("MACRO(32)".parse::<Action>().unwrap(), a([0x70, 31, 0xff]));
+        assert_eq!("macro(1)".parse::<Action>().unwrap(), a([0x70, 0, 1]));
+        assert_eq!("MACRO(32)".parse::<Action>().unwrap(), a([0x70, 31, 1]));
+        assert_eq!("MACRO(5, hold)".parse::<Action>().unwrap(), a([0x70, 4, 0]));
+        assert_eq!(
+            "macro(5,Toggle)".parse::<Action>().unwrap(),
+            a([0x70, 4, 0xff])
+        );
         assert_eq!("0x950020".parse::<Action>().unwrap(), a([0x95, 0, 0x20]));
         assert_eq!("NO".parse::<Action>().unwrap(), Action::NONE);
         for bad in [
@@ -331,6 +405,9 @@ mod tests {
             "0x1234",
             "MACRO(0)",
             "MACRO(33)",
+            "MACRO(1, 2)",
+            "MACRO(1, loop)",
+            "MACRO(1, )",
             "",
             "VOLU+A",
         ] {
