@@ -247,9 +247,10 @@ raw `0xKKAABB`. Fields of a travel entry: `actuation`, `trigger` (`normal`,
 `rapid`, `continuous`), `press`, `release`, `upper_deadzone`, `lower_deadzone`.
 
 Writes are deliberately narrow. `apply` writes only key actions, travel
-records and macro regions (rewritten whole per mode, laid out as NuPhy IO lays
-them out), refuses DKS, Mod-Tap, Toggle and Snap Tap keys (assign or remove those
-in NuPhy IO), never assigns factory reset or the firmware loader, and sends no
+records and macro regions (a changed mode's region is re-laid out the way NuPhy
+IO lays it out, and only the 56-byte windows that differ are sent), refuses DKS, Mod-Tap, Toggle and Snap Tap keys (assign or remove those
+in NuPhy IO), never assigns factory reset or the firmware loader (not even from a backup), only
+talks to the Air60 HE (`19f5:fee0`, the one layout it knows), and sends no
 command outside the read and write commands it needs. Before writing it saves
 the matrix, travel tables and macros to `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`,
 and afterwards reads them back and fails unless they match.

@@ -9,6 +9,7 @@
 //! - Anything else (DKS, Toggle, Mod-Tap, Snap Tap, mouse, ...) is shown and
 //!   accepted as raw hex `0xKKAABB`.
 
+use crate::he::protocol::{LAYERS, MACRO_COUNT};
 use crate::keycodes::{KeycodeGroup, lookup_code, lookup_name};
 use anyhow::{Context, Result, bail};
 use std::fmt;
@@ -18,6 +19,8 @@ pub const KIND_CONSUMER: u8 = 0x30;
 pub const KIND_MACRO: u8 = 0x70;
 pub const KIND_FUNCTION: u8 = 0xf0;
 const FN_LAYER: u8 = 0xff;
+const FIRMWARE_LOADER: u8 = 0x07;
+const FACTORY_RESET: u8 = 0x08;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Action(pub [u8; 3]);
@@ -32,11 +35,25 @@ impl Action {
     pub fn is_writable(self) -> bool {
         match self.0 {
             [KIND_KEY | KIND_CONSUMER, ..] => true,
-            [KIND_MACRO, _, 0xff] => true,
-            [KIND_FUNCTION, FN_LAYER, layer] => layer < crate::he::protocol::LAYERS,
-            [KIND_FUNCTION, f, _] => FUNCTIONS.iter().any(|x| x.0 == f && x.2),
+            [KIND_MACRO, slot, 0xff] => usize::from(slot) < MACRO_COUNT,
+            [KIND_FUNCTION, FN_LAYER, layer] => layer < LAYERS,
+            [KIND_FUNCTION, f, 0] => FUNCTIONS.iter().any(|x| x.0 == f && x.2),
             _ => false,
         }
+    }
+
+    /// The absolute layer of a momentary-layer action.
+    pub fn layer(self) -> Option<u8> {
+        match self.0 {
+            [KIND_FUNCTION, FN_LAYER, layer] if layer < LAYERS => Some(layer),
+            _ => None,
+        }
+    }
+
+    /// Never written to the keyboard by any command, `restore-backup`
+    /// included: the firmware loader and factory reset.
+    pub fn is_forbidden(self) -> bool {
+        matches!(self.0, [KIND_FUNCTION, FIRMWARE_LOADER | FACTORY_RESET, _])
     }
 }
 
@@ -147,8 +164,10 @@ impl fmt::Display for Action {
                     None => write!(f, "CONSUMER(0x{usage:03x})"),
                 }
             }
-            KIND_MACRO if b == 0xff => write!(f, "MACRO({})", u16::from(a) + 1),
-            KIND_FUNCTION if a == FN_LAYER => write!(f, "FN({b})"),
+            KIND_MACRO if b == 0xff && usize::from(a) < MACRO_COUNT => {
+                write!(f, "MACRO({})", u16::from(a) + 1)
+            }
+            KIND_FUNCTION if a == FN_LAYER && b < LAYERS => write!(f, "FN({b})"),
             KIND_FUNCTION if b == 0 => match FUNCTIONS.iter().find(|x| x.0 == a) {
                 Some((_, name, _)) => f.write_str(name),
                 None => write!(f, "0x{kind:02x}{a:02x}{b:02x}"),
@@ -192,19 +211,17 @@ impl std::str::FromStr for Action {
         }
         if let Some(n) = call(s, "FN") {
             let layer = parse_number(n)?;
-            if layer >= u32::from(crate::he::protocol::LAYERS) {
+            if layer >= u32::from(LAYERS) {
                 bail!("layer {layer} out of range in {s:?} (0..=11)");
             }
             return Ok(Self([KIND_FUNCTION, FN_LAYER, layer as u8]));
         }
         if let Some(n) = call(s, "MACRO") {
             let number = parse_number(n)?;
-            let slot = u8::try_from(number.wrapping_sub(1))
-                .ok()
-                .filter(|&n| n < 0xff);
-            let slot =
-                slot.with_context(|| format!("macro number out of range in {s:?} (from 1)"))?;
-            return Ok(Self([KIND_MACRO, slot, 0xff]));
+            if !(1..=MACRO_COUNT as u32).contains(&number) {
+                bail!("macro number out of range in {s:?} (1..={MACRO_COUNT})");
+            }
+            return Ok(Self([KIND_MACRO, (number - 1) as u8, 0xff]));
         }
         if let Some(n) = call(s, "CONSUMER") {
             let usage = u16::try_from(parse_number(n)?)
@@ -285,6 +302,8 @@ mod tests {
         assert_eq!("FN(9)".parse::<Action>().unwrap(), a([0xf0, 0xff, 9]));
         assert_eq!("macro(1)".parse::<Action>().unwrap(), a([0x70, 0, 0xff]));
         assert!("MACRO(0)".parse::<Action>().is_err());
+        assert!("MACRO(33)".parse::<Action>().is_err());
+        assert_eq!("MACRO(32)".parse::<Action>().unwrap(), a([0x70, 31, 0xff]));
         assert_eq!("0x950020".parse::<Action>().unwrap(), a([0x95, 0, 0x20]));
         assert_eq!("NO".parse::<Action>().unwrap(), Action::NONE);
         assert!("FN(12)".parse::<Action>().is_err());
@@ -306,6 +325,9 @@ mod tests {
             [0xf0, 0xfe, 0],
             [0x92, 1, 2],
             [0x10, 0, 0xfe],
+            [0xf0, 0xff, 12],
+            [0x70, 0xff, 0xff],
+            [0x70, 32, 0xff],
         ] {
             let action = a(bytes);
             assert_eq!(
@@ -327,5 +349,10 @@ mod tests {
         assert!(!a([0xf0, 0x07, 0]).is_writable());
         assert!(!a([0xf0, 0x08, 0]).is_writable());
         assert!(!a([0x95, 0, 0x20]).is_writable());
+        assert!(!a([0x70, 32, 0xff]).is_writable());
+        assert!(!a([0xf0, 0x52, 7]).is_writable());
+        assert!(a([0xf0, 0x07, 0]).is_forbidden());
+        assert!(a([0xf0, 0x08, 0]).is_forbidden());
+        assert!(!a([0xf0, 0x52, 0]).is_forbidden());
     }
 }

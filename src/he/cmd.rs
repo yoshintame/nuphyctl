@@ -21,6 +21,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 const NUPHY_VID: u16 = 0x19f5;
+/// The board whose slot layout `model::AIR60_HE` describes.
+const AIR60_HE_PID: u16 = 0xfee0;
 /// Firmware versions the write path was checked against.
 const WRITE_FIRMWARE: std::ops::RangeInclusive<u32> = 110..=139;
 
@@ -67,6 +69,12 @@ impl Keyboard<'_> {
                 self.firmware.version,
                 WRITE_FIRMWARE.start(),
                 WRITE_FIRMWARE.end()
+            );
+        }
+        if let Some(c) = plan.actions.iter().find(|c| c.to.is_forbidden()) {
+            bail!(
+                "refusing to write: {} assigns a forbidden action",
+                c.describe()
             );
         }
         let backup = backup(current)?;
@@ -141,8 +149,16 @@ fn with_keyboard<T>(
     selector: &DeviceSelector,
     f: impl FnOnce(&Keyboard) -> Result<T>,
 ) -> Result<T> {
+    if selector.vid.is_some_and(|v| v != NUPHY_VID)
+        || selector.pid.is_some_and(|p| p != AIR60_HE_PID)
+    {
+        bail!(
+            "only the Air60 HE ({NUPHY_VID:04x}:{AIR60_HE_PID:04x}) has a known key layout; other boards are not supported yet"
+        );
+    }
     let selector = DeviceSelector {
-        vid: selector.vid.or(Some(NUPHY_VID)),
+        vid: Some(NUPHY_VID),
+        pid: Some(AIR60_HE_PID),
         ..selector.clone()
     };
     let dev = open_selected_device(api, &selector)?;
@@ -342,6 +358,9 @@ pub fn run_apply(api: &HidApi, args: &HeApplyArgs) -> Result<()> {
         .with_context(|| format!("failed to read {}", args.file.display()))?;
     let config =
         parse_config(&text).with_context(|| format!("invalid config {}", args.file.display()))?;
+    for note in check_config(&config)? {
+        eprintln!("note: {note}");
+    }
     with_keyboard(api, &args.device, |kb| {
         let state = kb.state()?;
         let plan = plan_changes(&config, &state.matrix, &state.travel, &state.macros)?;
@@ -359,7 +378,7 @@ pub fn run_restore_backup(api: &HidApi, args: &HeRestoreBackupArgs) -> Result<()
         .with_context(|| format!("failed to read {}", args.file.display()))?;
     if bytes.len() != BACKUP_BYTES && bytes.len() != LEGACY_BACKUP_BYTES {
         bail!(
-            "{} is {} bytes, not an HE backup ({BACKUP_BYTES} bytes)",
+            "{} is {} bytes, not an HE backup ({BACKUP_BYTES} bytes, or {LEGACY_BACKUP_BYTES} without macros)",
             args.file.display(),
             bytes.len()
         );
@@ -374,8 +393,19 @@ pub fn run_restore_backup(api: &HidApi, args: &HeRestoreBackupArgs) -> Result<()
             actions: Vec::new(),
             travel: Vec::new(),
             macros: Vec::new(),
+            raw_macro_regions: Vec::new(),
             want_macros: state.macros.clone(),
         };
+        for layer in 0..crate::he::protocol::LAYERS {
+            let at = usize::from(layer) * crate::he::protocol::LAYER_BYTES;
+            let tail =
+                at + crate::he::protocol::MATRIX_SLOTS * 3..at + crate::he::protocol::LAYER_BYTES;
+            if state.matrix.0[tail.clone()] != want_matrix.0[tail] {
+                eprintln!(
+                    "note: bytes 384..512 of layer {layer} (G keys) differ from the backup; this tool does not write them"
+                );
+            }
+        }
         for mode in 0..MODES {
             for slot in 0..crate::he::protocol::MATRIX_SLOTS {
                 for layer in 0..LAYERS_PER_MODE {
@@ -405,20 +435,28 @@ pub fn run_restore_backup(api: &HidApi, args: &HeRestoreBackupArgs) -> Result<()
         if !saved_macros.is_empty() {
             let saved = Macros::from_bytes(saved_macros.to_vec())?;
             for mode in 0..MODES {
-                let (now, then) = (state.macros.decode(mode)?, saved.decode(mode)?);
-                let changed: Vec<_> = (0..now.len())
-                    .filter(|&i| now[i] != then[i])
-                    .map(|index| MacroChange {
-                        mode,
-                        index,
-                        from: now[index].clone(),
-                        to: then[index].clone(),
-                    })
-                    .collect();
-                if !changed.is_empty() {
-                    plan.want_macros.set_region(mode, saved.region(mode));
-                    plan.macros.extend(changed);
+                if state.macros.region(mode) == saved.region(mode) {
+                    continue;
                 }
+                match (state.macros.decode(mode), saved.decode(mode)) {
+                    (Ok(now), Ok(then)) => {
+                        let changed: Vec<_> = (0..now.len())
+                            .filter(|&i| now[i] != then[i])
+                            .map(|index| MacroChange {
+                                mode,
+                                index,
+                                from: now[index].clone(),
+                                to: then[index].clone(),
+                            })
+                            .collect();
+                        if changed.is_empty() {
+                            continue;
+                        }
+                        plan.macros.extend(changed);
+                    }
+                    _ => plan.raw_macro_regions.push(mode),
+                }
+                plan.want_macros.set_region(mode, saved.region(mode));
             }
         }
         let backup = if args.dry_run || plan.is_empty() {

@@ -472,17 +472,20 @@ impl TravelSpec {
                 "upper_deadzone" => spec.upper_deadzone = Some(mm()?),
                 "lower_deadzone" => spec.lower_deadzone = Some(mm()?),
                 "trigger" => {
-                    let name = v
-                        .as_str()
-                        .with_context(|| format!("{source}.trigger must be a string"))?;
-                    let t = TRIGGERS
-                        .iter()
-                        .position(|t| t.eq_ignore_ascii_case(name))
-                        .with_context(|| {
-                            format!(
-                                "{source}.trigger {name:?} (expected normal, rapid or continuous)"
-                            )
-                        })?;
+                    let t = match v {
+                        toml::Value::String(name) => TRIGGERS
+                            .iter()
+                            .position(|t| t.eq_ignore_ascii_case(name))
+                            .with_context(|| {
+                                format!(
+                                    "{source}.trigger {name:?} (expected normal, rapid, continuous or a raw 0..=15)"
+                                )
+                            })? as i64,
+                        toml::Value::Integer(n) if (0..=15).contains(n) => *n,
+                        _ => bail!(
+                            "{source}.trigger must be normal, rapid, continuous or a raw 0..=15"
+                        ),
+                    };
                     spec.trigger = Some(t as u8);
                 }
                 other => bail!(
@@ -505,10 +508,10 @@ impl TravelSpec {
         if let Some(t) = self.trigger
             && (base.is_none() || base.and_then(|b| b.trigger) != Some(t))
         {
-            parts.push(format!(
-                "trigger = \"{}\"",
-                TRIGGERS.get(usize::from(t)).unwrap_or(&"normal")
-            ));
+            match TRIGGERS.get(usize::from(t)) {
+                Some(name) => parts.push(format!("trigger = \"{name}\"")),
+                None => parts.push(format!("trigger = {t}")),
+            }
         }
         let fields = [
             ("press", self.press, base.and_then(|b| b.press)),
@@ -561,6 +564,8 @@ pub fn parse_config(text: &str) -> Result<Config> {
     let table: toml::Table = text.parse().context("invalid TOML")?;
     let mut config = Config::default();
     let mut sources: HashMap<(u8, u8, usize), String> = HashMap::new();
+    let mut macro_sources: HashMap<(u8, usize), String> = HashMap::new();
+    let mut travel_sources: HashMap<u8, String> = HashMap::new();
     for (mode_key, sections) in &table {
         let mode = parse_mode(mode_key).with_context(|| format!("in [{mode_key}]"))?;
         let sections = sections
@@ -571,6 +576,10 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 .as_table()
                 .with_context(|| format!("[{mode_key}.{section}] must be a table"))?;
             if section == "travel" {
+                let source = format!("[{mode_key}.travel]");
+                if let Some(previous) = travel_sources.insert(mode, source.clone()) {
+                    bail!("{source} configures the same mode as {previous}");
+                }
                 parse_travel(mode, mode_key, keys, &mut config)?;
                 continue;
             }
@@ -585,6 +594,9 @@ pub fn parse_config(text: &str) -> Result<Config> {
                         .with_context(|| {
                             format!("{source}: macro numbers are 1..={MACRO_COUNT}")
                         })?;
+                    if let Some(previous) = macro_sources.insert((mode, index), source.clone()) {
+                        bail!("{source} sets the same macro as {previous}");
+                    }
                     config
                         .macros
                         .insert((mode, index), Macro::parse(value, &source)?);
@@ -767,7 +779,9 @@ pub fn plan_changes(
         if wanted.is_empty() {
             continue;
         }
-        let mut list = macros.decode(mode)?;
+        let mut list = macros.decode(mode).context(
+            "the macro region does not decode (an interrupted write?); restore the backup the failed write printed with `he restore-backup`, or rewrite the macros in NuPhy IO",
+        )?;
         for (&(_, index), to) in wanted {
             if list[index] != *to {
                 macro_changes.push(MacroChange {
@@ -789,6 +803,7 @@ pub fn plan_changes(
         actions,
         travel: records,
         macros: macro_changes,
+        raw_macro_regions: Vec::new(),
         want_macros,
     })
 }
@@ -799,12 +814,18 @@ pub struct Plan {
     pub actions: Vec<ActionChange>,
     pub travel: Vec<TravelChange>,
     pub macros: Vec<MacroChange>,
+    /// Modes whose macro region is rewritten byte for byte without a
+    /// per-macro diff (restoring over a region that does not decode).
+    pub raw_macro_regions: Vec<u8>,
     pub want_macros: Macros,
 }
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.actions.is_empty() && self.travel.is_empty() && self.macros.is_empty()
+        self.actions.is_empty()
+            && self.travel.is_empty()
+            && self.macros.is_empty()
+            && self.raw_macro_regions.is_empty()
     }
 
     pub fn describe(&self) -> Vec<String> {
@@ -813,6 +834,12 @@ impl Plan {
             .map(ActionChange::describe)
             .chain(self.travel.iter().map(TravelChange::describe))
             .chain(self.macros.iter().map(MacroChange::describe))
+            .chain(self.raw_macro_regions.iter().map(|&m| {
+                format!(
+                    "{}.macros: whole region restored byte for byte (the current one does not decode)",
+                    mode_label(m)
+                )
+            }))
             .collect()
     }
 }
@@ -822,10 +849,22 @@ impl Plan {
 /// are listed, since `apply` accepts them only where the keyboard already
 /// holds them.
 pub fn check_config(config: &Config) -> Result<Vec<String>> {
-    let stock = TravelRecord([0xa2, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // Stock records with 0.01, 0.005 and 0.001 mm Rapid Trigger steps: a
+    // press or release value only has to fit one of them; which one the
+    // keyboard uses is known only at apply.
+    let stocks =
+        [0x00, 0x0a, 0x14].map(|steps| TravelRecord([0xa2, 0x00, 0x95, steps, 0, 0, 0, 0]));
+    let mut notes = Vec::new();
     for (&(mode, slot), spec) in &config.travel {
-        spec.apply_to(stock)
-            .with_context(|| format!("{}.travel {}", mode_label(mode), position_name(slot)))?;
+        let at = format!("{}.travel {}", mode_label(mode), position_name(slot));
+        if let Err(err) = spec.apply_to(stocks[0]) {
+            if !stocks[1..].iter().any(|r| spec.apply_to(*r).is_ok()) {
+                return Err(err.context(at));
+            }
+            notes.push(format!(
+                "{at}: press/release need a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one"
+            ));
+        }
     }
     for mode in 0..MODES {
         let mut list = vec![Macro::default(); MACRO_COUNT];
@@ -834,19 +873,28 @@ pub fn check_config(config: &Config) -> Result<Vec<String>> {
         }
         encode_region(&list).with_context(|| format!("{}.macros", mode_label(mode)))?;
     }
-    Ok(config
-        .actions
-        .iter()
-        .filter(|(_, a)| !a.is_writable())
-        .map(|(&(mode, layer, slot), a)| {
-            format!(
-                "{}.{} {} = {a}: not written by this tool; apply passes only if the keyboard already holds it",
-                mode_label(mode),
-                LAYER_NAMES[usize::from(layer)],
-                position_name(slot)
-            )
-        })
-        .collect())
+    for (&(mode, layer, slot), a) in &config.actions {
+        let at = format!(
+            "{}.{} {} = {a}",
+            mode_label(mode),
+            LAYER_NAMES[usize::from(layer)],
+            position_name(slot)
+        );
+        if !a.is_writable() {
+            notes.push(format!(
+                "{at}: not written by this tool; apply passes only if the keyboard already holds it"
+            ));
+        }
+        if let Some(target) = a.layer()
+            && target / LAYERS_PER_MODE != mode
+        {
+            notes.push(format!(
+                "{at}: FN(n) is absolute and layer {target} belongs to {}",
+                mode_label(target / LAYERS_PER_MODE)
+            ));
+        }
+    }
+    Ok(notes)
 }
 
 /// One write: the region's byte address and payload.
@@ -948,7 +996,15 @@ pub fn export_config(
                 ));
             }
         }
-        let list = macros.decode(mode)?;
+        let list = match macros.decode(mode) {
+            Ok(list) => list,
+            Err(err) => {
+                out.push_str(&format!(
+                    "\n# [{m}.macros] left out: the macro region does not decode ({err:#})\n"
+                ));
+                Vec::new()
+            }
+        };
         if list.iter().any(|m| !m.0.is_empty()) {
             out.push_str(&format!("\n[{m}.macros]\n"));
             for (index, mac) in list.iter().enumerate() {
@@ -1139,6 +1195,19 @@ mod tests {
         assert!(parse_config("[m1.travel]\nW = { actuation = \"x\" }").is_err());
         assert!(parse_config("[m1.travel]\nW = { speed = 1 }").is_err());
         assert!(parse_config("[m1.travel]\nW = { trigger = \"fast\" }").is_err());
+        assert!(parse_config("[m1.travel]\nW = { trigger = 16 }").is_err());
+        assert_eq!(
+            parse_config("[m1.travel]\nW = { trigger = 5 }")
+                .unwrap()
+                .travel[&(0, 16)]
+                .trigger,
+            Some(5)
+        );
+        assert!(parse_config("[m1.macros]\n1 = \"LCTL+Z\"\n01 = \"LCTL+C\"").is_err());
+        assert!(
+            parse_config("[m1.travel]\nW = { actuation = 1 }\n[1.travel]\nQ = { actuation = 1 }")
+                .is_err()
+        );
         assert!(parse_config("[m1.macros]\n33 = \"LCTL+C\"").is_err());
         assert!(parse_config("[m1.macros]\n0 = \"LCTL+C\"").is_err());
         assert!(parse_config("[m1.macros]\n0 = [\"C sideways\"]").is_err());
@@ -1193,15 +1262,80 @@ mod tests {
     #[test]
     fn checks_config_offline() {
         let notes = check_config(&parse_config(SAMPLE).unwrap()).unwrap();
-        assert!(notes.is_empty());
+        assert!(notes.is_empty(), "{notes:?}");
+        let notes =
+            check_config(&parse_config("[m1.travel]\nW = { press = 0.105 }").unwrap()).unwrap();
+        assert!(notes[0].contains("finer Rapid Trigger step"), "{notes:?}");
         let notes = check_config(&parse_config("[m2.base]\nS = \"0x950020\"").unwrap()).unwrap();
         assert_eq!(notes.len(), 1);
+        let notes = check_config(&parse_config("[m2.base]\nCAPS = \"FN(1)\"").unwrap()).unwrap();
+        assert!(notes[0].contains("belongs to m1"), "{notes:?}");
+        let notes = check_config(&parse_config("[m2.base]\nCAPS = \"FN(5)\"").unwrap()).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
         assert!(
             check_config(&parse_config("[m1.travel]\nW = { actuation = 3.5 }").unwrap()).is_err()
         );
         assert!(
-            check_config(&parse_config("[m1.travel]\nW = { press = 0.015 }").unwrap()).is_err()
+            check_config(&parse_config("[m1.travel]\nW = { press = 0.0013 }").unwrap()).is_err()
         );
+    }
+
+    /// Trigger values without a name survive export -> parse -> plan.
+    #[test]
+    fn unknown_trigger_round_trips() {
+        let matrix = blank_matrix();
+        let mut travel = blank_travel();
+        for slot in 0..key_count() {
+            let mut r = travel.get(0, slot);
+            r.set_trigger(3);
+            travel.set(0, slot, r);
+        }
+        let macros = blank_macros();
+        let text = export_config(&[0], &matrix, &matrix, &travel, &macros).unwrap();
+        assert!(text.contains("trigger = 3"), "{text}");
+        let plan = plan_changes(&parse_config(&text).unwrap(), &matrix, &travel, &macros).unwrap();
+        assert!(plan.is_empty(), "{:?}", plan.describe());
+    }
+
+    /// A half-written macro region: export says so instead of failing, and
+    /// apply refuses with a pointer to restore-backup.
+    #[test]
+    fn undecodable_macro_region() {
+        let matrix = blank_matrix();
+        let travel = blank_travel();
+        let mut macros = blank_macros();
+        let mut region = vec![0u8; MACRO_BYTES];
+        for i in 0..MACRO_COUNT {
+            region[2 * i] = 80;
+        }
+        macros.set_region(0, &region);
+        let text = export_config(&[0], &matrix, &matrix, &travel, &macros).unwrap();
+        assert!(text.contains("# [m1.macros] left out"), "{text}");
+        let config = parse_config("[m1.macros]\n1 = \"LCTL+C\"").unwrap();
+        let err = plan_changes(&config, &matrix, &travel, &macros).unwrap_err();
+        assert!(format!("{err:#}").contains("restore-backup"), "{err:#}");
+        let config = parse_config("[m2.macros]\n1 = \"LCTL+C\"").unwrap();
+        assert!(plan_changes(&config, &matrix, &travel, &macros).is_ok());
+    }
+
+    /// Everything export prints parses back, raw fallbacks included.
+    #[test]
+    fn export_of_odd_actions_parses_back() {
+        let mut current = blank_matrix();
+        current.set(0, 0, 0, Action([0xf0, 0xff, 12]));
+        current.set(0, 0, 1, Action([0x70, 0xff, 0xff]));
+        current.set(0, 0, 2, Action([0x70, 40, 0xff]));
+        let text = export_config(
+            &[0],
+            &current,
+            &blank_matrix(),
+            &blank_travel(),
+            &blank_macros(),
+        )
+        .unwrap();
+        let config = parse_config(&text).unwrap();
+        assert_eq!(config.actions[&(0, 0, 0)], Action([0xf0, 0xff, 12]));
+        assert_eq!(config.actions[&(0, 0, 2)], Action([0x70, 40, 0xff]));
     }
 
     #[test]

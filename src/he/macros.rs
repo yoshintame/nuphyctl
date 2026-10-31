@@ -14,8 +14,7 @@ use crate::keycodes::{KeycodeGroup, lookup_code, lookup_name};
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-pub const MACRO_BYTES: usize = 2048;
-pub const MACRO_COUNT: usize = 32;
+pub use crate::he::protocol::{MACRO_BYTES, MACRO_COUNT};
 const HEADER: usize = MACRO_COUNT * 2;
 const STEP: usize = 4;
 
@@ -91,7 +90,11 @@ fn parse_target(input: &str) -> Result<(u8, u8)> {
         let (kind, code) = args
             .split_once(',')
             .with_context(|| format!("{input:?}: expected CODE(kind,code)"))?;
-        return Ok((parse_u8(kind)?, parse_u8(code)?));
+        let kind = parse_u8(kind)?;
+        if !(1..=0x3f).contains(&kind) {
+            bail!("{input:?}: a step kind is 1..=63 (the flags byte keeps 6 bits for it)");
+        }
+        return Ok((kind, parse_u8(code)?));
     }
     if let Some(args) = parse_args(input, "MOUSE") {
         return Ok((KIND_MOUSE, parse_u8(args)?));
@@ -413,6 +416,8 @@ mod tests {
             assert_eq!(text.parse::<Step>().unwrap().to_string(), text);
         }
         assert!("C sideways".parse::<Step>().is_err());
+        assert!("CODE(64,1) down".parse::<Step>().is_err());
+        assert!("CODE(0,0) up".parse::<Step>().is_err());
         assert!("C down x".parse::<Step>().is_err());
     }
 

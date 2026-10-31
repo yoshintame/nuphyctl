@@ -28,6 +28,9 @@ pub const LAYER_BYTES: usize = 512;
 pub const TRAVEL_RECORD: usize = 8;
 /// One mode's travel table: 128 records of 8 bytes.
 pub const TRAVEL_BYTES: usize = MATRIX_SLOTS * TRAVEL_RECORD;
+/// One mode's macro region: 32 `u16` offsets, then 4-byte steps.
+pub const MACRO_BYTES: usize = 2048;
+pub const MACRO_COUNT: usize = 32;
 const BASE_BYTES: usize = 16;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -167,6 +170,9 @@ pub fn build(cmd: u8, addr: u16, len: u8, data: &[u8]) -> Result<Report> {
 }
 
 fn guard_write(cmd: u8, addr: u16, data: &[u8]) -> Result<()> {
+    if data.is_empty() {
+        bail!("refusing an empty write");
+    }
     let addr = usize::from(addr);
     match cmd {
         CMD_SET_USE_MATRIX => {
@@ -184,8 +190,9 @@ fn guard_write(cmd: u8, addr: u16, data: &[u8]) -> Result<()> {
                 bail!("write reaches past the last layer");
             }
             for action in data.chunks(ACTION_LEN) {
-                if action[0] == 0xf0 && action[1] == 0x07 {
-                    bail!("refusing to assign the reboot-into-firmware-loader action");
+                let action = crate::he::actions::Action([action[0], action[1], action[2]]);
+                if action.is_forbidden() {
+                    bail!("refusing to assign {action} to a key");
                 }
             }
         }
@@ -198,7 +205,7 @@ fn guard_write(cmd: u8, addr: u16, data: &[u8]) -> Result<()> {
             }
         }
         CMD_SET_MACRO => {
-            let region = crate::he::macros::MACRO_BYTES;
+            let region = MACRO_BYTES;
             if addr / region != (addr + data.len() - 1) / region {
                 bail!("a macro write stays within one mode's region");
             }
@@ -313,6 +320,9 @@ mod tests {
         assert!(guard_write(CMD_SET_USE_MATRIX, a + 1, &[0x10, 0, 0x29]).is_err());
         assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0x10, 0]).is_err());
         assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0xf0, 0x07, 0]).is_err());
+        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[0xf0, 0x08, 0]).is_err());
+        assert!(guard_write(CMD_SET_USE_MATRIX, a, &[]).is_err());
+        assert!(guard_write(CMD_SET_MACRO, 0, &[]).is_err());
         assert!(guard_write(CMD_SET_USE_MATRIX, matrix_addr(0, 0, 128), &[0x10, 0, 4]).is_err());
         assert!(guard_write(CMD_SET_USE_MATRIX, matrix_addr(2, 3, 127), &[0x10, 0, 4]).is_ok());
     }
