@@ -209,7 +209,6 @@ impl fmt::Display for Change {
             Self::Travel { at, from, to } => {
                 let (before, after) = (TravelSpec::of(from), TravelSpec::of(to));
                 if before == after {
-                    // Only bits without a config field differ.
                     write!(f, "{at}: raw {} -> {}", from.hex(), to.hex())
                 } else {
                     write!(

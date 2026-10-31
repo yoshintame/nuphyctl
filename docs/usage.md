@@ -275,8 +275,9 @@ Writes are deliberately narrow:
   put it back; where a backup holds one the keyboard no longer does,
   `restore-backup` leaves that key as it is and says so.
 - Travel values the keyboard can hold but this tool does not write (actuation
-  outside 0.1..3.3 mm, press or release over 3.3 mm) are notes, not errors: an
-  export of such a keyboard checks and applies as long as the value stays.
+  outside 0.1..3.3 mm, press or release over 3.3 mm, a raw `trigger` number)
+  are notes, not errors: an export of such a keyboard checks and applies as
+  long as the value stays.
 - `check` proves each mode's listed macros fit on their own; `apply` keeps the
   keyboard's other macros next to them, so it can still run out of room.
 - Only the Air60 HE (`19f5:fee0`) is talked to: it is the one layout known.
@@ -289,12 +290,18 @@ Writes are deliberately narrow:
   backup. While it exists, `apply` and `export` refuse: a write that stopped
   half way can leave macros that decode but are wrong. `restore-backup`
   clears it. A `restore-backup` that stops half way itself leaves the marker
-  naming the first backup, the one taken before the damage.
+  naming the first backup, the one taken before the damage; its own backup is
+  printed as the half-written state, flagged in its header, and refused by
+  `restore-backup`.
 
 Backups start with a header (format version, vendor and product id, firmware
 version). `restore-backup` refuses a backup of another board and notes a
 firmware difference. It restores byte for byte wherever the tool writes, even a
 macro region a broken write left undecodable.
+
+With `--json`, `he apply` and `he restore-backup` print `status` (`no_changes`,
+`dry_run` or `written`), `changes`, `notes` and the `backup` written, which is
+not the shape `keymap apply` prints.
 
 ## Device selection
 

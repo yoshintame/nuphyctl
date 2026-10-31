@@ -25,7 +25,7 @@ use crate::he::layout::{
 use crate::he::macros::{Macro, encode_region};
 use crate::he::region::{LAYERS_PER_MODE, MACRO_COUNT, MODES};
 use crate::he::state::{Matrix, State};
-use crate::he::travel::TravelSpec;
+use crate::he::travel::{ONLY_IF_HELD, TravelSpec};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -204,9 +204,7 @@ pub fn check_config(config: &Config) -> Result<Vec<String>> {
     }
     for (at, a) in &config.actions {
         if let Some(why) = a.assign_refusal() {
-            notes.push(format!(
-                "{at} = {a}: {why}; apply passes only if the keyboard already holds it"
-            ));
+            notes.push(format!("{at} = {a}: {why}; {ONLY_IF_HELD}"));
         }
         if let Some(target) = a.layer()
             && target / LAYERS_PER_MODE != at.mode

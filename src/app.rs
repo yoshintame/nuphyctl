@@ -39,7 +39,7 @@ struct SideLightCommand {
     palette_index: u8,
 }
 
-pub fn run(cli: Cli, api: &HidApi) -> Result<()> {
+pub fn run(cli: Cli, api: &mut HidApi) -> Result<()> {
     match cli.command {
         Command::Commands => {
             print_commands();

@@ -18,12 +18,15 @@ pub struct Plan {
     writes: Vec<(Region, WriteChunk)>,
     /// Things worth knowing that the plan does not change.
     notes: Vec<String>,
+    /// Brings back a backup: the one write that may start while an earlier
+    /// one is unfinished.
+    restore: bool,
 }
 
 impl Plan {
     /// Diff `want` against `current` into changes and packets, every packet
     /// checked against its region's write rules.
-    fn new(current: State, want: State, notes: Vec<String>) -> Result<Self> {
+    fn new(current: State, want: State, notes: Vec<String>, restore: bool) -> Result<Self> {
         let changes = current.changes_to(&want);
         let mut writes = Vec::new();
         for region in Region::ALL {
@@ -38,7 +41,12 @@ impl Plan {
             changes,
             writes,
             notes,
+            restore,
         })
+    }
+
+    pub fn is_restore(&self) -> bool {
+        self.restore
     }
 
     pub fn is_empty(&self) -> bool {
@@ -110,7 +118,7 @@ pub fn plan_changes(config: &Config, current: &State) -> Result<Plan> {
             want.macros.set_macros(mode, &wanted)?;
         }
     }
-    Plan::new(current.clone(), want, Vec::new())
+    Plan::new(current.clone(), want, Vec::new(), false)
 }
 
 /// The plan that brings `current` back to `backup`, byte for byte wherever
@@ -132,11 +140,18 @@ pub fn plan_restore(current: &State, backup: &State) -> Result<Plan> {
             for slot in 0..MATRIX_SLOTS {
                 let at = KeyRef { mode, layer, slot };
                 let (now, then) = (current.matrix.action(at), backup.matrix.action(at));
-                if then.never_write() && now != then {
+                if now == then {
+                    continue;
+                }
+                if then.never_write() {
                     notes.push(format!(
                         "{at}: the backup holds {then}, which no command writes; the key keeps {now} (set it in NuPhy IO)"
                     ));
                     want.matrix.set_action(at, now);
+                } else if now.never_write() {
+                    notes.push(format!(
+                        "{at}: the key holds {now}, which no command writes; restoring puts {then} there for good"
+                    ));
                 }
             }
         }
@@ -149,7 +164,7 @@ pub fn plan_restore(current: &State, backup: &State) -> Result<Plan> {
             want.macros.copy_region(mode, &current.macros);
         }
     }
-    Plan::new(current.clone(), want, notes)
+    Plan::new(current.clone(), want, notes, true)
 }
 
 #[cfg(test)]
@@ -211,8 +226,6 @@ mod tests {
         let remap = parse_config("[m1.fn1]\nC = \"LCTL+C\"").unwrap();
         assert_eq!(plan_changes(&remap, &current).unwrap().changes().len(), 1);
 
-        // Factory reset is never written, so a key holding it is not
-        // replaced: restore-backup could not put it back.
         let fn1_lbrc = KeyRef {
             mode: 0,
             layer: 1,
@@ -303,6 +316,14 @@ mod tests {
         let plan = plan_restore(&same, &backup).unwrap();
         assert!(plan.notes().is_empty(), "the key still holds it");
         assert_eq!(plan.changes().len(), 1);
+
+        let plan = plan_restore(&backup, &current).unwrap();
+        assert_eq!(plan.want().matrix.action(at), Action::NONE);
+        assert!(
+            plan.notes().iter().any(|n| n.contains("for good")),
+            "{:?}",
+            plan.notes()
+        );
     }
 
     /// Changes and writes come from the same diff: whenever one is empty,

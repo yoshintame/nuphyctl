@@ -6,9 +6,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const REPORT_LEN: usize = 64;
+pub type Report = [u8; REPORT_LEN];
+
 const CONNECT_MAX_ATTEMPTS: usize = 4;
 const CONNECT_RETRY_BASE_DELAY_MS: u64 = 120;
-
 const RETRYABLE_HID_ERROR_PATTERNS: [&str; 6] = [
     "no such device",
     "protocol error",
@@ -17,7 +18,6 @@ const RETRYABLE_HID_ERROR_PATTERNS: [&str; 6] = [
     "no matching hid device found",
     "short write",
 ];
-pub type Report = [u8; REPORT_LEN];
 
 #[derive(Clone, Copy, Debug)]
 pub struct HidResponder {
@@ -200,8 +200,9 @@ pub fn open_selected_device(api: &HidApi, selector: &DeviceSelector) -> Result<H
 }
 
 /// Open the selected device and drain stale input reports, retrying while
-/// the error looks transient.
-pub fn connect_with_retry(api: &HidApi, selector: &DeviceSelector) -> Result<HidDevice> {
+/// the error looks transient, with the device list read anew each time so a
+/// replugged keyboard is found.
+pub fn connect_with_retry(api: &mut HidApi, selector: &DeviceSelector) -> Result<HidDevice> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -221,6 +222,7 @@ pub fn connect_with_retry(api: &HidApi, selector: &DeviceSelector) -> Result<Hid
         thread::sleep(Duration::from_millis(
             CONNECT_RETRY_BASE_DELAY_MS * attempt as u64,
         ));
+        api.refresh_devices()?;
     }
 }
 

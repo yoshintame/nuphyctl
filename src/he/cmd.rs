@@ -12,7 +12,7 @@ use crate::he::pending;
 use crate::he::plan::{Plan, plan_changes, plan_restore};
 use crate::he::protocol::{Base, FirmwareInfo, HeProtocol};
 use crate::he::region::{LAYERS_PER_MODE, MODES, Region, WriteChunk};
-use crate::he::snapshot::{self, Identity};
+use crate::he::snapshot::{self, Header, Identity};
 use crate::he::state::{MacroBank, Matrix, State, TravelTable};
 use crate::he::travel::{FIELDS, mm};
 use crate::hid_transport::connect_with_retry;
@@ -76,8 +76,10 @@ impl Keyboard<'_> {
 /// Back up the plan's current state into `dir`, mark the write unfinished,
 /// `send` the plan's writes, `read_back` everything and require it to equal
 /// the wanted state. Returns the new backup; on failure the error names the
-/// backup to restore, which is an earlier one if an earlier write is still
-/// unfinished.
+/// backup to restore. Only a restore may start while an earlier write is
+/// unfinished: it keeps that write's backup as the one to restore, and its
+/// own backup, of possibly half-written data, is marked so it is never
+/// restored.
 fn write_and_verify(
     dir: &Path,
     identity: Identity,
@@ -86,22 +88,26 @@ fn write_and_verify(
     read_back: impl FnOnce() -> Result<State>,
 ) -> Result<PathBuf> {
     identity.firmware.check_writes()?;
-    let backup = write_backup(dir, "he", &snapshot::encode(identity, plan.current()))
-        .context("failed to save a backup; nothing was written")?;
-    eprintln!("backup: {}", backup.display());
-    let restore = pending::begin_in(dir, &backup)?;
-    if restore != backup {
-        eprintln!(
-            "note: an earlier write is still unfinished; restore its backup {} if this one fails too",
-            restore.display()
-        );
+    if !plan.is_restore() {
+        pending::ensure_none_in(dir)?;
     }
-    let restore_hint = || {
-        format!(
-            "restore with: nuphyctl he restore-backup {}",
-            restore.display()
-        )
+    let over_unfinished = pending::unfinished_in(dir)?.is_some();
+    let header = Header {
+        identity,
+        over_unfinished,
     };
+    let backup = write_backup(dir, "he", &snapshot::encode(header, plan.current()))
+        .context("failed to save a backup; nothing was written")?;
+    let restore = pending::begin_in(dir, &backup, plan.is_restore())?;
+    if over_unfinished {
+        eprintln!(
+            "backup of the half-written state (never restored): {}",
+            backup.display()
+        );
+    } else {
+        eprintln!("backup: {}", backup.display());
+    }
+    let restore_hint = || pending::restore_hint(&restore);
     for (region, chunk) in plan.writes() {
         send(*region, chunk).with_context(|| format!("write failed; {}", restore_hint()))?;
     }
@@ -118,7 +124,7 @@ fn write_and_verify(
 }
 
 fn with_keyboard<T>(
-    api: &HidApi,
+    api: &mut HidApi,
     selector: &DeviceSelector,
     f: impl FnOnce(&Keyboard) -> Result<T>,
 ) -> Result<T> {
@@ -155,14 +161,14 @@ fn modes(mode: Option<u8>) -> Vec<u8> {
 fn warn_if_unfinished() -> Result<()> {
     if let Some(backup) = pending::unfinished()? {
         eprintln!(
-            "warning: a previous write did not finish; the keyboard may hold half-written data (restore with: nuphyctl he restore-backup {})",
-            backup.display()
+            "warning: a previous write did not finish; the keyboard may hold half-written data ({})",
+            pending::restore_hint(&backup)
         );
     }
     Ok(())
 }
 
-pub fn run_info(api: &HidApi, args: &HeInfoArgs) -> Result<()> {
+pub fn run_info(api: &mut HidApi, args: &HeInfoArgs) -> Result<()> {
     warn_if_unfinished()?;
     with_keyboard(api, &args.device, |kb| {
         let version = kb.firmware.version;
@@ -193,7 +199,7 @@ struct DumpRow {
     factory: Action,
 }
 
-pub fn run_dump(api: &HidApi, args: &HeDumpArgs) -> Result<()> {
+pub fn run_dump(api: &mut HidApi, args: &HeDumpArgs) -> Result<()> {
     warn_if_unfinished()?;
     let read = &args.read;
     with_keyboard(api, &read.device, |kb| {
@@ -261,7 +267,7 @@ pub fn run_dump(api: &HidApi, args: &HeDumpArgs) -> Result<()> {
     })
 }
 
-pub fn run_travel(api: &HidApi, args: &HeReadArgs) -> Result<()> {
+pub fn run_travel(api: &mut HidApi, args: &HeReadArgs) -> Result<()> {
     warn_if_unfinished()?;
     with_keyboard(api, &args.device, |kb| {
         let table = kb.travel()?;
@@ -310,7 +316,7 @@ pub fn run_travel(api: &HidApi, args: &HeReadArgs) -> Result<()> {
     })
 }
 
-pub fn run_export(api: &HidApi, args: &HeExportArgs) -> Result<()> {
+pub fn run_export(api: &mut HidApi, args: &HeExportArgs) -> Result<()> {
     pending::ensure_none()?;
     with_keyboard(api, &args.device, |kb| {
         let state = kb.state()?;
@@ -331,7 +337,7 @@ pub fn run_check(args: &HeCheckArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run_apply(api: &HidApi, args: &HeApplyArgs) -> Result<()> {
+pub fn run_apply(api: &mut HidApi, args: &HeApplyArgs) -> Result<()> {
     pending::ensure_none()?;
     let config = load_config(&args.config)?;
     let notes = check_config(&config)
@@ -339,16 +345,27 @@ pub fn run_apply(api: &HidApi, args: &HeApplyArgs) -> Result<()> {
     with_keyboard(api, &args.write.device, |kb| {
         let mut plan = plan_changes(&config, &kb.state()?)?;
         plan.add_notes(notes);
-        finish(kb, &args.write, &args.config, &plan)
+        finish(kb, &args.write, &args.config, &plan).map(drop)
     })
 }
 
-pub fn run_restore_backup(api: &HidApi, args: &HeRestoreArgs) -> Result<()> {
+pub fn run_restore_backup(api: &mut HidApi, args: &HeRestoreArgs) -> Result<()> {
     let file = &args.backup;
     let bytes =
         std::fs::read(file).with_context(|| format!("failed to read {}", file.display()))?;
-    let (identity, saved) =
+    let (header, saved) =
         snapshot::decode(&bytes).with_context(|| format!("cannot use {}", file.display()))?;
+    if header.over_unfinished {
+        let instead = match pending::unfinished()? {
+            Some(earlier) => pending::restore_hint(&earlier),
+            None => "restore the backup the interrupted write printed first".to_string(),
+        };
+        bail!(
+            "{} was taken over an unfinished write and may hold half-written data; {instead}",
+            file.display()
+        );
+    }
+    let identity = header.identity;
     with_keyboard(api, &args.write.device, |kb| {
         let here = kb.identity();
         if (identity.vid, identity.pid) != (here.vid, here.pid) {
@@ -368,8 +385,8 @@ pub fn run_restore_backup(api: &HidApi, args: &HeRestoreArgs) -> Result<()> {
                 identity.firmware, here.firmware
             )]);
         }
-        finish(kb, &args.write, file, &plan)?;
-        if !args.write.dry_run {
+        let outcome = finish(kb, &args.write, file, &plan)?;
+        if matches!(outcome, Outcome::NoChanges) && !args.write.dry_run {
             // The keyboard now holds the backup: any unfinished write is undone.
             pending::end()?;
         }
@@ -383,21 +400,22 @@ enum Outcome {
     Written(PathBuf),
 }
 
-/// The plan's writes were checked when it was made; check the firmware in
-/// every case too, so a dry run fails exactly where a real run would; then
-/// write unless it is a dry run.
-fn finish(kb: &Keyboard, args: &HeWriteArgs, file: &Path, plan: &Plan) -> Result<()> {
-    if !plan.is_empty() {
-        kb.firmware.version.check_writes()?;
-    }
+/// The plan's writes were checked when it was made; check the firmware too,
+/// so a dry run fails exactly where a real run would; then write unless it
+/// is a dry run.
+fn finish(kb: &Keyboard, args: &HeWriteArgs, file: &Path, plan: &Plan) -> Result<Outcome> {
     let outcome = if plan.is_empty() {
         Outcome::NoChanges
-    } else if args.dry_run {
-        Outcome::DryRun
     } else {
-        Outcome::Written(kb.write(plan)?)
+        kb.firmware.version.check_writes()?;
+        if args.dry_run {
+            Outcome::DryRun
+        } else {
+            Outcome::Written(kb.write(plan)?)
+        }
     };
-    report(args.json, file, plan, &outcome)
+    report(args.json, file, plan, &outcome)?;
+    Ok(outcome)
 }
 
 fn report(as_json: bool, file: &Path, plan: &Plan, outcome: &Outcome) -> Result<()> {
@@ -484,9 +502,26 @@ mod tests {
         snapshot::decode(&std::fs::read(path).unwrap()).unwrap().1
     }
 
+    fn header(path: &Path) -> Header {
+        snapshot::decode(&std::fs::read(path).unwrap()).unwrap().0
+    }
+
+    /// The backups in `dir`, oldest first.
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+            .collect();
+        paths.sort_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap());
+        paths
+    }
+
     /// An apply stops half way, then the restore it points to stops half way
     /// too: the marker and every hint keep naming the backup taken before
-    /// the damage, and restoring that one brings the keyboard back.
+    /// the damage, the restore's own backup is marked as half-written, no
+    /// apply may start, and restoring the first backup brings the keyboard
+    /// back.
     #[test]
     fn an_interrupted_restore_keeps_the_first_backup() {
         let dir = std::env::temp_dir().join(format!("nuphyctl-chain-{}", std::process::id()));
@@ -509,6 +544,19 @@ mod tests {
         let err = format!("{:#}", kb.write(&dir, &restore).unwrap_err());
         assert!(err.contains(&first.display().to_string()), "{err}");
         assert_eq!(pending::unfinished_in(&dir).unwrap(), Some(first.clone()));
+        let marked: Vec<bool> = backups(&dir)
+            .iter()
+            .map(|p| header(p).over_unfinished)
+            .collect();
+        assert_eq!(marked, [false, true], "only the restore's backup is marked");
+
+        let half = kb.now();
+        let esc = parse_config("[m2.base]\nESC = \"F1\"").unwrap();
+        let again = plan_changes(&esc, &half).unwrap();
+        kb.budget.set(usize::MAX);
+        assert!(kb.write(&dir, &again).is_err(), "no apply over the marker");
+        assert_eq!(kb.now(), half);
+        assert_eq!(backups(&dir).len(), 2, "and no backup either");
 
         kb.budget.set(usize::MAX);
         let restore = plan_restore(&kb.now(), &saved(&first)).unwrap();

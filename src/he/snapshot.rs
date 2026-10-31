@@ -4,7 +4,7 @@
 //! ```text
 //! 0   12  magic "nuphyctl-he\0"
 //! 12  1   format version (1)
-//! 13  1   reserved (0)
+//! 13  1   flags: bit 0 set when taken over an unfinished write
 //! 14  2   USB vendor id, little endian
 //! 16  2   USB product id
 //! 18  2   firmware version
@@ -20,6 +20,17 @@ const MAGIC: &[u8; 12] = b"nuphyctl-he\0";
 const FORMAT: u8 = 1;
 const HEADER: usize = 20;
 
+const OVER_UNFINISHED: u8 = 1;
+
+/// What a backup's header says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub identity: Identity,
+    /// Taken while an earlier write was still unfinished, so it may hold
+    /// half-written data: not a state to restore.
+    pub over_unfinished: bool,
+}
+
 /// The keyboard a backup was taken from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -28,11 +39,16 @@ pub struct Identity {
     pub firmware: FirmwareVersion,
 }
 
-pub fn encode(identity: Identity, state: &State) -> Vec<u8> {
+pub fn encode(header: Header, state: &State) -> Vec<u8> {
+    let identity = header.identity;
     let mut out = Vec::with_capacity(HEADER + Region::ALL.iter().map(|r| r.len()).sum::<usize>());
     out.extend_from_slice(MAGIC);
     out.push(FORMAT);
-    out.push(0);
+    out.push(if header.over_unfinished {
+        OVER_UNFINISHED
+    } else {
+        0
+    });
     out.extend_from_slice(&identity.vid.to_le_bytes());
     out.extend_from_slice(&identity.pid.to_le_bytes());
     out.extend_from_slice(&identity.firmware.to_u16().to_le_bytes());
@@ -42,7 +58,7 @@ pub fn encode(identity: Identity, state: &State) -> Vec<u8> {
     out
 }
 
-pub fn decode(bytes: &[u8]) -> Result<(Identity, State)> {
+pub fn decode(bytes: &[u8]) -> Result<(Header, State)> {
     if bytes.len() < HEADER || &bytes[..MAGIC.len()] != MAGIC {
         bail!("not an nuphyctl he backup (no header)");
     }
@@ -69,7 +85,11 @@ pub fn decode(bytes: &[u8]) -> Result<(Identity, State)> {
         at += r.len();
         part
     });
-    Ok((identity, State::from_regions(regions)?))
+    let header = Header {
+        identity,
+        over_unfinished: bytes[13] & OVER_UNFINISHED != 0,
+    };
+    Ok((header, State::from_regions(regions)?))
 }
 
 #[cfg(test)]
@@ -79,15 +99,24 @@ mod tests {
 
     #[test]
     fn round_trips_and_rejects_strangers() {
-        let id = Identity {
-            vid: 0x19f5,
-            pid: 0xfee0,
-            firmware: FirmwareVersion::Bcd(0x120),
+        let header = Header {
+            identity: Identity {
+                vid: 0x19f5,
+                pid: 0xfee0,
+                firmware: FirmwareVersion::Bcd(0x120),
+            },
+            over_unfinished: false,
         };
         let state = blank_state();
-        let bytes = encode(id, &state);
+        let bytes = encode(header, &state);
         assert_eq!(&bytes[..12], b"nuphyctl-he\0");
-        assert_eq!(decode(&bytes).unwrap(), (id, state));
+        assert_eq!(bytes[13], 0, "a plain backup reads as before the flag");
+        assert_eq!(decode(&bytes).unwrap(), (header, state.clone()));
+        let marked = Header {
+            over_unfinished: true,
+            ..header
+        };
+        assert_eq!(decode(&encode(marked, &state)).unwrap().0, marked);
 
         let mut wrong_format = bytes.clone();
         wrong_format[12] = 2;

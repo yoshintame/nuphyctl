@@ -306,18 +306,20 @@ pub fn encode_region(macros: &[Macro]) -> Result<Vec<u8>> {
             at += STEP;
         }
     }
-    let empty_at = match empty_at {
-        Some(e) => e,
-        None => {
-            if at + STEP > MACRO_BYTES {
-                bail!("macros do not fit the {MACRO_BYTES}-byte region");
+    if used < MACRO_COUNT {
+        let empty_at = match empty_at {
+            Some(e) => e,
+            None => {
+                if at + STEP > MACRO_BYTES {
+                    bail!("macros do not fit the {MACRO_BYTES}-byte region");
+                }
+                region[at..at + STEP].copy_from_slice(&EMPTY_STEP);
+                at
             }
-            region[at..at + STEP].copy_from_slice(&EMPTY_STEP);
-            at
+        };
+        for off in offsets.iter_mut().skip(used) {
+            *off = empty_at;
         }
-    };
-    for off in offsets.iter_mut().skip(used) {
-        *off = empty_at;
     }
     for (i, off) in offsets.iter().enumerate() {
         region[2 * i] = *off as u8;
@@ -496,5 +498,29 @@ mod tests {
         assert!(decode_region(&broken).is_err());
         let never_written = decode_region(&vec![0u8; MACRO_BYTES]).unwrap();
         assert!(never_written.iter().all(|m| m.0.is_empty()));
+    }
+
+    /// 32 macros that fill the region to the last byte fit; one step more
+    /// does not.
+    #[test]
+    fn a_full_region_fits_exactly() {
+        let tap = |n: usize| {
+            Macro::new(
+                (0..n)
+                    .map(|i| Step {
+                        target: Target::Key(4),
+                        down: i % 2 == 0,
+                        delay: 1,
+                    })
+                    .collect(),
+            )
+        };
+        let mut list: Vec<Macro> = (0..MACRO_COUNT)
+            .map(|i| tap(if i < 16 { 16 } else { 15 }))
+            .collect();
+        let region = encode_region(&list).unwrap();
+        assert_eq!(decode_region(&region).unwrap(), list);
+        list[31] = tap(16);
+        assert!(encode_region(&list).is_err());
     }
 }

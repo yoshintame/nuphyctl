@@ -24,6 +24,8 @@ pub struct TravelRecord(pub [u8; TRAVEL_RECORD]);
 const NINE_BITS: u16 = 0x1ff;
 const TRAVEL_STEP_UM: u32 = 10;
 const DEAD_ZONE_MAX: u16 = 0x7f;
+/// What a note says about a value this tool does not write.
+pub const ONLY_IF_HELD: &str = "apply passes only if the keyboard already holds it";
 
 /// Rapid Trigger sensitivity step selected by two bits of byte 3.
 fn step_um(bits: u8) -> u32 {
@@ -391,7 +393,12 @@ impl TravelSpec {
     /// asked value is left alone, so values outside the ranges this tool
     /// writes survive an export and apply untouched.
     pub fn apply_to(&self, mut record: TravelRecord) -> Result<TravelRecord> {
-        if let Some(t) = self.trigger {
+        if let Some(t) = self.trigger
+            && t != record.trigger()
+        {
+            if let Trigger::Raw(n) = t {
+                bail!("trigger {n} has no name, and this tool writes only named ones");
+            }
             record.set_trigger(t);
         }
         for field in &FIELDS {
@@ -408,9 +415,13 @@ impl TravelSpec {
     /// entry is an error. What only the keyboard can settle comes back as
     /// notes: a sensitivity that needs a finer step than 0.01 mm (which step
     /// a key uses is known at apply), and a value outside what this tool
-    /// writes (apply passes only if the key already holds it).
+    /// writes, or a trigger without a name (apply passes only if the key
+    /// already holds it), and a sensitivity too coarse for the finer steps.
     pub fn check_offline(&self) -> Result<Vec<String>> {
         let mut notes = Vec::new();
+        if let Some(Trigger::Raw(n)) = self.trigger {
+            notes.push(format!("trigger {n} has no name; {ONLY_IF_HELD}"));
+        }
         for field in &FIELDS {
             let Some(um) = self.length(field.id) else {
                 continue;
@@ -426,12 +437,17 @@ impl TravelSpec {
                     "{} needs a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one",
                     field.name
                 ));
+            } else if field.sensitivity
+                && [Step::Um5, Step::Um1].into_iter().any(|s| fits(s).is_err())
+            {
+                notes.push(format!(
+                    "{} {} mm does not fit a key with a finer Rapid Trigger step; apply fails on such keys",
+                    field.name,
+                    mm(um)
+                ));
             }
             if !field.writable.contains(&um) {
-                notes.push(format!(
-                    "{}; apply passes only if the keyboard already holds it",
-                    field.outside_writable(um)
-                ));
+                notes.push(format!("{}; {ONLY_IF_HELD}", field.outside_writable(um)));
             }
         }
         Ok(notes)
@@ -600,13 +616,29 @@ mod tests {
         let finer = spec(FieldId::Press, 105).check_offline().unwrap();
         assert!(finer.len() == 1 && finer[0].contains("finer"), "{finer:?}");
         assert_eq!(spec(FieldId::Press, 3).check_offline().unwrap().len(), 1);
+        let coarse = spec(FieldId::Press, 600).check_offline().unwrap();
+        assert!(
+            coarse.len() == 1 && coarse[0].contains("finer Rapid Trigger step;"),
+            "{coarse:?}"
+        );
+        let raw = TravelSpec {
+            trigger: Some(Trigger::Raw(7)),
+            ..Default::default()
+        };
+        let notes = raw.check_offline().unwrap();
+        assert!(
+            notes.len() == 1 && notes[0].contains("already holds"),
+            "{notes:?}"
+        );
+        let mut held = record([0x02, 0x07, 0x95, 0, 0, 0, 0, 0]);
+        assert_eq!(raw.apply_to(held).unwrap(), held, "kept when already held");
+        held.set_trigger(Trigger::Normal);
+        assert!(raw.apply_to(held).is_err(), "never written");
 
-        // Values the keyboard can hold but this tool does not write are
-        // notes: an export of such a keyboard still checks and applies.
         for (id, um) in [(FieldId::Actuation, 3500), (FieldId::Press, 4010)] {
             let notes = spec(id, um).check_offline().unwrap();
             assert!(
-                notes.len() == 1 && notes[0].contains("already holds"),
+                notes.iter().any(|n| n.contains("already holds")),
                 "{notes:?}"
             );
         }

@@ -30,9 +30,7 @@ const MACRO_HOLD: u8 = 0x00;
 const MACRO_TOGGLE: u8 = 0xff;
 const FIRMWARE_LOADER: u8 = 0x07;
 const FACTORY_RESET: u8 = 0x08;
-const LINKED_REFUSAL: &str =
-    "it points into a DKS, Toggle, Mod-Tap or Snap Tap table this tool does not edit";
-const UNKNOWN_REFUSAL: &str = "this tool does not know what it does";
+const FROZEN_REFUSAL: &str = "no command writes it, so restore-backup could not put it back";
 
 /// The three bytes of a matrix slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +58,21 @@ pub enum ActionKind {
     Linked([u8; 3]),
     /// A kind this tool does not know (mouse, system, out-of-range slots, ...).
     Unknown([u8; 3]),
+}
+
+/// What `apply` and `restore-backup` may do with an action. Each step down
+/// allows less; whatever `apply` may replace, `restore-backup` may write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// Assigned and replaced.
+    Free,
+    /// Replaced, but not assigned.
+    ReplaceOnly(&'static str),
+    /// Neither assigned nor replaced; `restore-backup` still writes it back.
+    Kept(&'static str),
+    /// The firmware loader and factory reset, whatever the third byte holds:
+    /// never written by any command, so never replaced either.
+    Frozen,
 }
 
 /// How a macro key plays its macro, checked on an Air60 HE.
@@ -213,37 +226,45 @@ impl Action {
         }
     }
 
-    /// Why `apply` may not put this action on a key, if it may not.
-    pub fn assign_refusal(self) -> Option<&'static str> {
+    /// What `apply` and `restore-backup` may do with this action.
+    pub fn policy(self) -> Policy {
+        if matches!(self.0, [KIND_FUNCTION, FIRMWARE_LOADER | FACTORY_RESET, _]) {
+            return Policy::Frozen;
+        }
         match self.kind() {
             ActionKind::Function(code) if !function(code).is_some_and(|f| f.assignable) => {
-                Some("this tool does not assign this keyboard function")
+                Policy::ReplaceOnly("this tool does not assign this keyboard function")
             }
-            ActionKind::Linked(_) => Some(LINKED_REFUSAL),
-            ActionKind::Unknown(_) => Some(UNKNOWN_REFUSAL),
-            _ => None,
+            ActionKind::Linked(_) => Policy::Kept(
+                "it points into a DKS, Toggle, Mod-Tap or Snap Tap table this tool does not edit",
+            ),
+            ActionKind::Unknown(_) => Policy::Kept("this tool does not know what it does"),
+            _ => Policy::Free,
         }
     }
 
-    /// Why `apply` may not replace this action with another, if it may not:
-    /// actions that point into tables this tool does not edit, whose meaning
-    /// it does not know, or that `restore-backup` could never put back.
-    pub fn replace_refusal(self) -> Option<&'static str> {
-        if self.never_write() {
-            return Some("no command writes it, so restore-backup could not put it back");
+    /// Why `apply` may not put this action on a key, if it may not.
+    pub fn assign_refusal(self) -> Option<&'static str> {
+        match self.policy() {
+            Policy::Free => None,
+            Policy::ReplaceOnly(why) | Policy::Kept(why) => Some(why),
+            Policy::Frozen => Some(FROZEN_REFUSAL),
         }
-        match self.kind() {
-            ActionKind::Linked(_) => Some(LINKED_REFUSAL),
-            ActionKind::Unknown(_) => Some(UNKNOWN_REFUSAL),
-            _ => None,
+    }
+
+    /// Why `apply` may not replace this action with another, if it may not.
+    pub fn replace_refusal(self) -> Option<&'static str> {
+        match self.policy() {
+            Policy::Free | Policy::ReplaceOnly(_) => None,
+            Policy::Kept(why) => Some(why),
+            Policy::Frozen => Some(FROZEN_REFUSAL),
         }
     }
 
     /// Never written to the keyboard by any command, `restore-backup`
-    /// included: the firmware loader and factory reset, whatever the third
-    /// byte holds.
+    /// included.
     pub fn never_write(self) -> bool {
-        matches!(self.0, [KIND_FUNCTION, FIRMWARE_LOADER | FACTORY_RESET, _])
+        self.policy() == Policy::Frozen
     }
 
     /// The absolute layer of a momentary-layer action.

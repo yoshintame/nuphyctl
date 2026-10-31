@@ -17,6 +17,6 @@ use hidapi::HidApi;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-    app::run(cli, &api)
+    let mut api = HidApi::new().context("failed to initialize hidapi")?;
+    app::run(cli, &mut api)
 }
