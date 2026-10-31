@@ -186,7 +186,7 @@ fn um_from_toml(value: &toml::Value, source: &str) -> Result<u32> {
     Ok(um as u32)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
     Normal,
     Rapid,
@@ -253,43 +253,88 @@ impl fmt::Display for Trigger {
     }
 }
 
+/// The length fields of a travel record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldId {
+    Actuation,
+    Press,
+    Release,
+    UpperDeadzone,
+    LowerDeadzone,
+}
+
 /// A length field of a travel record, by its config name.
 pub struct Field {
+    pub id: FieldId,
     pub name: &'static str,
     pub get: fn(&TravelRecord) -> u32,
     set: fn(&mut TravelRecord, u32) -> Result<()>,
+    /// Counted in Rapid Trigger steps, whose size the record itself selects.
+    pub sensitivity: bool,
 }
 
 pub static FIELDS: [Field; 5] = [
     Field {
+        id: FieldId::Actuation,
         name: "actuation",
         get: TravelRecord::actuation_um,
         set: TravelRecord::set_actuation_um,
+        sensitivity: false,
     },
     Field {
+        id: FieldId::Press,
         name: "press",
         get: TravelRecord::press_um,
         set: TravelRecord::set_press_um,
+        sensitivity: true,
     },
     Field {
+        id: FieldId::Release,
         name: "release",
         get: TravelRecord::release_um,
         set: TravelRecord::set_release_um,
+        sensitivity: true,
     },
     Field {
+        id: FieldId::UpperDeadzone,
         name: "upper_deadzone",
         get: TravelRecord::upper_deadzone_um,
         set: TravelRecord::set_upper_deadzone_um,
+        sensitivity: false,
     },
     Field {
+        id: FieldId::LowerDeadzone,
         name: "lower_deadzone",
         get: TravelRecord::lower_deadzone_um,
         set: TravelRecord::set_lower_deadzone_um,
+        sensitivity: false,
     },
 ];
 
+/// Rapid Trigger step sizes a record can select, as byte 3 encodes them for
+/// both press and release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Um10,
+    Um5,
+    Um1,
+}
+
+impl TravelRecord {
+    /// A stock record (switch 2, 1.50 mm, normal trigger) with `step` for
+    /// both press and release: what offline checks validate against.
+    pub fn stock(step: Step) -> Self {
+        let bits = match step {
+            Step::Um10 => 0,
+            Step::Um5 => 1,
+            Step::Um1 => 2,
+        };
+        Self([0xa2, 0, 0x95, (bits << 1) | (bits << 3), 0, 0, 0, 0])
+    }
+}
+
 /// What a config travel entry asks for; unset fields keep the keyboard's value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TravelSpec {
     pub trigger: Option<Trigger>,
     /// Micrometres, in `FIELDS` order.
@@ -317,20 +362,46 @@ impl TravelSpec {
         }
     }
 
+    pub fn length(&self, id: FieldId) -> Option<u32> {
+        self.lengths[id as usize]
+    }
+
+    /// `record` with this spec's fields set. A field that already holds the
+    /// asked value is left alone, so values outside the ranges this tool
+    /// writes survive an export and apply untouched.
     pub fn apply_to(&self, mut record: TravelRecord) -> Result<TravelRecord> {
         if let Some(t) = self.trigger {
             record.set_trigger(t);
         }
-        for (field, value) in FIELDS.iter().zip(self.lengths) {
-            if let Some(um) = value {
+        for field in &FIELDS {
+            if let Some(um) = self.length(field.id)
+                && um != (field.get)(&record)
+            {
                 (field.set)(&mut record, um).with_context(|| field.name)?;
             }
         }
         Ok(record)
     }
 
-    pub fn sets_sensitivity(&self) -> bool {
-        self.lengths[1].is_some() || self.lengths[2].is_some()
+    /// Checks without a keyboard. Sensitivity values only have to fit one of
+    /// the step sizes a key can use (which one it uses is known at apply);
+    /// one that needs a finer step than 0.01 mm gets a note.
+    pub fn check_offline(&self) -> Result<Option<String>> {
+        let Err(err) = self.apply_to(TravelRecord::stock(Step::Um10)) else {
+            return Ok(None);
+        };
+        let finer = [Step::Um5, Step::Um1]
+            .iter()
+            .any(|step| self.apply_to(TravelRecord::stock(*step)).is_ok());
+        let sets_sensitivity = FIELDS
+            .iter()
+            .any(|f| f.sensitivity && self.length(f.id).is_some());
+        if sets_sensitivity && finer {
+            return Ok(Some(
+                "press/release need a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one".into(),
+            ));
+        }
+        Err(err)
     }
 
     pub fn parse(value: &toml::Value, source: &str) -> Result<Self> {
@@ -344,14 +415,14 @@ impl TravelSpec {
                 spec.trigger = Some(Trigger::from_toml(v, &at)?);
                 continue;
             }
-            let i = FIELDS.iter().position(|f| f.name == key).with_context(|| {
+            let field = FIELDS.iter().find(|f| f.name == key).with_context(|| {
                 let names: Vec<&str> = FIELDS.iter().map(|f| f.name).collect();
                 format!(
                     "unknown field {key:?} in {source} (expected trigger, {})",
                     names.join(", ")
                 )
             })?;
-            spec.lengths[i] = Some(um_from_toml(v, &at)?);
+            spec.lengths[field.id as usize] = Some(um_from_toml(v, &at)?);
         }
         Ok(spec)
     }
@@ -365,9 +436,9 @@ impl TravelSpec {
         {
             parts.push(format!("trigger = {}", t.to_toml()));
         }
-        for (i, field) in FIELDS.iter().enumerate() {
-            if let Some(um) = self.lengths[i]
-                && base.is_none_or(|b| b.lengths[i] != self.lengths[i])
+        for field in &FIELDS {
+            if let Some(um) = self.length(field.id)
+                && base.is_none_or(|b| b.length(field.id) != self.length(field.id))
             {
                 parts.push(format!("{} = {}", field.name, mm(um)));
             }
@@ -440,6 +511,56 @@ mod tests {
     }
 
     #[test]
+    fn fields_line_up_with_their_ids() {
+        for (i, f) in FIELDS.iter().enumerate() {
+            assert_eq!(f.id as usize, i, "{}", f.name);
+        }
+    }
+
+    /// A value the keyboard holds outside the ranges this tool writes (here
+    /// press 4.01 mm) exports and applies back without being touched.
+    #[test]
+    fn unchanged_out_of_range_values_round_trip() {
+        let mut r = record([0x02, 0, 0x95, 0, 0x90, 0x01, 0, 0]);
+        assert_eq!(r.press_um(), 4010);
+        let spec = TravelSpec::of(&r);
+        assert_eq!(spec.apply_to(r).unwrap(), r);
+        r.set_actuation_um(1000).unwrap();
+        assert!(
+            TravelSpec {
+                lengths: [None, Some(4020), None, None, None],
+                ..Default::default()
+            }
+            .apply_to(r)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn offline_checks() {
+        let spec = |press| TravelSpec {
+            lengths: [None, Some(press), None, None, None],
+            ..Default::default()
+        };
+        assert_eq!(spec(100).check_offline().unwrap(), None);
+        assert!(
+            spec(105)
+                .check_offline()
+                .unwrap()
+                .unwrap()
+                .contains("finer")
+        );
+        assert!(spec(3).check_offline().unwrap().is_some());
+        let too_far = TravelSpec {
+            lengths: [Some(3500), None, None, None, None],
+            ..Default::default()
+        };
+        assert!(too_far.check_offline().is_err());
+        assert_eq!(TravelRecord::stock(Step::Um1).press_um(), 1);
+        assert_eq!(TravelRecord::stock(Step::Um5).release_um(), 5);
+    }
+
+    #[test]
     fn millimetres() {
         assert_eq!(mm(1500), "1.5");
         assert_eq!(mm(10), "0.01");
@@ -461,7 +582,9 @@ mod tests {
                 .unwrap();
         let w = TravelSpec::parse(&t["w"], "w").unwrap();
         assert_eq!(w.trigger, Some(Trigger::Rapid));
-        assert_eq!(w.lengths, [Some(500), Some(100), None, None, None]);
+        assert_eq!(w.length(FieldId::Actuation), Some(500));
+        assert_eq!(w.length(FieldId::Press), Some(100));
+        assert_eq!(w.length(FieldId::Release), None);
         assert_eq!(
             w.render(None),
             "{ trigger = \"rapid\", actuation = 0.5, press = 0.1 }"
@@ -476,7 +599,7 @@ mod tests {
             "{ trigger = \"rapid\", actuation = 0.5, press = 0.1 }"
         );
         assert_eq!(w.merged(x).trigger, Some(Trigger::Raw(5)));
-        assert_eq!(w.merged(x).lengths[0], Some(500));
+        assert_eq!(w.merged(x).length(FieldId::Actuation), Some(500));
 
         let bad: toml::Table = "a = { speed = 1 }\nb = { trigger = 16 }\nc = { actuation = \"x\" }"
             .parse()

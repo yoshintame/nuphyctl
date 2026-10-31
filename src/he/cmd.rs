@@ -1,27 +1,33 @@
 //! `nuphyctl he ...` command handlers.
 
+use crate::app::is_retryable_rgb_error;
 use crate::backup::{default_backup_dir, write_backup};
 use crate::cli::{
     DeviceSelector, HeCheckArgs, HeDumpArgs, HeExportArgs, HeInfoArgs, HeReadArgs, HeWriteArgs,
 };
 use crate::he::actions::Action;
 use crate::he::config::{check_config, export_config, load_config};
-use crate::he::layout::{LAYER_NAMES, key_count, mode_label, position_name};
-use crate::he::plan::{Plan, State, action_in, plan_changes, plan_restore};
+use crate::he::layout::{KeyRef, TravelRef, key_count, layer_name, mode_label, position_name};
+use crate::he::pending;
+use crate::he::plan::{Plan, plan_changes, plan_restore};
 use crate::he::protocol::{Base, FirmwareInfo, HeProtocol};
 use crate::he::region::{LAYERS_PER_MODE, MODES, Region};
 use crate::he::snapshot::{self, Identity};
+use crate::he::state::{Matrix, State, TravelTable};
 use crate::he::travel::{FIELDS, mm};
 use crate::hid_transport::{clear_input_reports, open_selected_device};
-use crate::keymap_cmd::print_json;
+use crate::output::print_json;
 use anyhow::{Context, Result, bail};
-use hidapi::HidApi;
+use hidapi::{HidApi, HidDevice};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::{thread, time::Duration};
 
 const NUPHY_VID: u16 = 0x19f5;
 /// The board whose slot layout `layout::AIR60_HE` describes.
 const AIR60_HE_PID: u16 = 0xfee0;
+const CONNECT_MAX_ATTEMPTS: usize = 4;
+const CONNECT_RETRY_BASE_DELAY_MS: u64 = 120;
 
 struct Keyboard<'a> {
     protocol: HeProtocol<'a>,
@@ -40,18 +46,21 @@ impl Keyboard<'_> {
     }
 
     fn state(&self) -> Result<State> {
-        let [matrix, travel, macros] = Region::ALL;
-        State::new([
-            self.protocol.read_region(matrix)?,
-            self.protocol.read_region(travel)?,
-            self.protocol.read_region(macros)?,
+        let read = |r| self.protocol.read_region(r);
+        State::from_regions([
+            read(Region::Matrix)?,
+            read(Region::Travel)?,
+            read(Region::Macros)?,
         ])
     }
 
-    /// Back up `current`, send the plan's writes, read everything back and
-    /// require it to equal the wanted state.
+    fn factory_matrix(&self) -> Result<Matrix> {
+        Matrix::from_bytes(self.protocol.read_factory_matrix()?)
+    }
+
+    /// Back up `current`, mark the write unfinished, send the plan's writes,
+    /// read everything back and require it to equal the wanted state.
     fn write_and_verify(&self, current: &State, plan: &Plan) -> Result<PathBuf> {
-        self.firmware.version.check_writes()?;
         let writes = plan.writes(current)?;
         let backup = write_backup(
             &default_backup_dir()?,
@@ -60,22 +69,50 @@ impl Keyboard<'_> {
         )
         .context("failed to save a backup; nothing was written")?;
         eprintln!("backup: {}", backup.display());
+        let restore_hint = || {
+            format!(
+                "restore with: nuphyctl he restore-backup {}",
+                backup.display()
+            )
+        };
+        pending::begin(&backup)?;
         for (region, chunk) in &writes {
-            self.protocol.write(*region, chunk).with_context(|| {
-                format!(
-                    "write failed; restore with: nuphyctl he restore-backup {}",
-                    backup.display()
-                )
-            })?;
+            self.protocol
+                .write(*region, chunk)
+                .with_context(|| format!("write failed; {}", restore_hint()))?;
         }
         let after = self.state().context("failed to read the keyboard back")?;
         if after != plan.want {
             bail!(
-                "verification failed: the keyboard does not hold what was written; restore with: nuphyctl he restore-backup {}",
-                backup.display()
+                "verification failed: the keyboard does not hold what was written; {}",
+                restore_hint()
             );
         }
+        pending::end()?;
         Ok(backup)
+    }
+}
+
+fn connect(api: &HidApi, selector: &DeviceSelector) -> Result<HidDevice> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let err = match open_selected_device(api, selector) {
+            Ok(dev) => match clear_input_reports(&dev) {
+                Ok(()) => return Ok(dev),
+                Err(err) => err,
+            },
+            Err(err) => err,
+        };
+        if !is_retryable_rgb_error(&err) || attempt >= CONNECT_MAX_ATTEMPTS {
+            return Err(err);
+        }
+        eprintln!(
+            "transient HID error (attempt {attempt}/{CONNECT_MAX_ATTEMPTS}): {err} -- retrying"
+        );
+        thread::sleep(Duration::from_millis(
+            CONNECT_RETRY_BASE_DELAY_MS * attempt as u64,
+        ));
     }
 }
 
@@ -96,8 +133,7 @@ fn with_keyboard<T>(
         pid: Some(AIR60_HE_PID),
         ..selector.clone()
     };
-    let dev = open_selected_device(api, &selector)?;
-    clear_input_reports(&dev)?;
+    let dev = connect(api, &selector)?;
     let protocol = HeProtocol::new(&dev);
     let firmware = protocol.firmware_info()?;
     let base = protocol.base(&firmware)?;
@@ -114,7 +150,19 @@ fn modes(mode: Option<u8>) -> Vec<u8> {
     mode.map_or_else(|| (0..MODES).collect(), |m| vec![m])
 }
 
+/// Reading commands still work after an unfinished write, but say so.
+fn warn_if_unfinished() -> Result<()> {
+    if let Some(backup) = pending::unfinished()? {
+        eprintln!(
+            "warning: a previous write did not finish; the keyboard may hold half-written data (restore with: nuphyctl he restore-backup {})",
+            backup.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn run_info(api: &HidApi, args: &HeInfoArgs) -> Result<()> {
+    warn_if_unfinished()?;
     with_keyboard(api, &args.device, |kb| {
         let version = kb.firmware.version;
         if args.json {
@@ -138,80 +186,97 @@ pub fn run_info(api: &HidApi, args: &HeInfoArgs) -> Result<()> {
     })
 }
 
+struct DumpRow {
+    at: KeyRef,
+    now: Action,
+    factory: Action,
+}
+
 pub fn run_dump(api: &HidApi, args: &HeDumpArgs) -> Result<()> {
+    warn_if_unfinished()?;
     let read = &args.read;
     with_keyboard(api, &read.device, |kb| {
-        let matrix = kb.protocol.read_region(Region::Matrix)?;
-        let factory = kb.protocol.read_factory_matrix()?;
-        let mut layers_json = Vec::new();
+        let matrix = Matrix::from_bytes(kb.protocol.read_region(Region::Matrix)?)?;
+        let factory = kb.factory_matrix()?;
+        let mut layers = Vec::new();
         for mode in modes(read.mode) {
             for layer in 0..LAYERS_PER_MODE {
-                let name = format!("{}.{}", mode_label(mode), LAYER_NAMES[usize::from(layer)]);
-                let shown: Vec<(usize, Action, Action)> = (0..key_count())
+                let rows: Vec<DumpRow> = (0..key_count())
                     .map(|slot| {
-                        let now = action_in(&matrix, mode, layer, slot);
-                        (slot, now, action_in(&factory, mode, layer, slot))
+                        let at = KeyRef { mode, layer, slot };
+                        DumpRow {
+                            at,
+                            now: matrix.action(at),
+                            factory: factory.action(at),
+                        }
                     })
-                    .filter(|(_, now, factory)| {
+                    .filter(|r| {
                         if args.changed {
-                            now != factory
+                            r.now != r.factory
                         } else {
-                            layer == 0 || *now != Action::NONE
+                            layer == 0 || r.now != Action::NONE
                         }
                     })
                     .collect();
-                if read.json {
-                    let keys: Vec<_> = shown
-                        .iter()
-                        .map(|(slot, now, factory)| {
-                            json!({
-                                "slot": slot,
-                                "position": position_name(*slot),
-                                "action": now.to_string(),
-                                "raw": format!("{:02x}{:02x}{:02x}", now.0[0], now.0[1], now.0[2]),
-                                "factory": factory.to_string(),
-                            })
-                        })
-                        .collect();
-                    layers_json.push(json!({ "layer": name, "keys": keys }));
-                    continue;
-                }
-                if shown.is_empty() {
-                    continue;
-                }
-                println!("{name}");
-                for (slot, now, factory) in shown {
-                    let mark = if now == factory {
-                        String::new()
-                    } else {
-                        format!("  (factory {factory})")
-                    };
-                    println!("  {:<6} {now}{mark}", position_name(slot));
-                }
+                layers.push((
+                    format!("{}.{}", mode_label(mode), layer_name(mode, layer)),
+                    rows,
+                ));
             }
         }
         if read.json {
-            print_json(&json!({ "changed_only": args.changed, "layers": layers_json }))?;
+            let layers: Vec<_> = layers
+                .iter()
+                .map(|(name, rows)| {
+                    let keys: Vec<_> = rows
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "slot": r.at.slot,
+                                "position": position_name(r.at.slot),
+                                "action": r.now.to_string(),
+                                "raw": format!("{:02x}{:02x}{:02x}", r.now.0[0], r.now.0[1], r.now.0[2]),
+                                "factory": r.factory.to_string(),
+                            })
+                        })
+                        .collect();
+                    json!({ "layer": name, "keys": keys })
+                })
+                .collect();
+            return print_json(&json!({ "changed_only": args.changed, "layers": layers }));
+        }
+        for (name, rows) in layers.iter().filter(|(_, rows)| !rows.is_empty()) {
+            println!("{name}");
+            for r in rows {
+                let mark = if r.now == r.factory {
+                    String::new()
+                } else {
+                    format!("  (factory {})", r.factory)
+                };
+                println!("  {:<6} {}{mark}", position_name(r.at.slot), r.now);
+            }
         }
         Ok(())
     })
 }
 
 pub fn run_travel(api: &HidApi, args: &HeReadArgs) -> Result<()> {
+    warn_if_unfinished()?;
     with_keyboard(api, &args.device, |kb| {
-        let state = kb.state()?;
-        let mut keys = Vec::new();
-        for mode in modes(args.mode) {
-            if !args.json {
-                println!("{}", mode_label(mode));
-            }
-            for slot in 0..key_count() {
-                let r = state.travel(mode, slot);
-                if args.json {
+        let table = TravelTable::from_bytes(kb.protocol.read_region(Region::Travel)?)?;
+        let rows: Vec<TravelRef> = modes(args.mode)
+            .into_iter()
+            .flat_map(|mode| (0..key_count()).map(move |slot| TravelRef { mode, slot }))
+            .collect();
+        if args.json {
+            let keys: Vec<_> = rows
+                .iter()
+                .map(|&at| {
+                    let r = table.record(at);
                     let mut entry = json!({
-                        "mode": mode_label(mode),
-                        "slot": slot,
-                        "position": position_name(slot),
+                        "mode": mode_label(at.mode),
+                        "slot": at.slot,
+                        "position": position_name(at.slot),
                         "switch": r.switch_type(),
                         "trigger": r.trigger().to_string(),
                         "raw": r.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
@@ -219,32 +284,36 @@ pub fn run_travel(api: &HidApi, args: &HeReadArgs) -> Result<()> {
                     for field in &FIELDS {
                         entry[field.name] = json!(f64::from((field.get)(&r)) / 1000.0);
                     }
-                    keys.push(entry);
-                    continue;
-                }
-                let lengths: Vec<String> = FIELDS
-                    .iter()
-                    .map(|f| format!("{} {}", f.name, mm((f.get)(&r))))
-                    .collect();
-                println!(
-                    "  {:<6} {:<10} {}",
-                    position_name(slot),
-                    r.trigger().to_string(),
-                    lengths.join("  ")
-                );
-            }
+                    entry
+                })
+                .collect();
+            return print_json(&json!({ "keys": keys }));
         }
-        if args.json {
-            print_json(&json!({ "keys": keys }))?;
+        for (i, &at) in rows.iter().enumerate() {
+            if i == 0 || rows[i - 1].mode != at.mode {
+                println!("{}", mode_label(at.mode));
+            }
+            let r = table.record(at);
+            let lengths: Vec<String> = FIELDS
+                .iter()
+                .map(|f| format!("{} {}", f.name, mm((f.get)(&r))))
+                .collect();
+            println!(
+                "  {:<6} {:<10} {}",
+                position_name(at.slot),
+                r.trigger().to_string(),
+                lengths.join("  ")
+            );
         }
         Ok(())
     })
 }
 
 pub fn run_export(api: &HidApi, args: &HeExportArgs) -> Result<()> {
+    pending::ensure_none()?;
     with_keyboard(api, &args.device, |kb| {
         let state = kb.state()?;
-        let factory = kb.protocol.read_factory_matrix()?;
+        let factory = kb.factory_matrix()?;
         print!("{}", export_config(&modes(args.mode), &state, &factory));
         Ok(())
     })
@@ -257,23 +326,19 @@ pub fn run_check(args: &HeCheckArgs) -> Result<()> {
     for note in &notes {
         println!("note: {note}");
     }
-    println!(
-        "ok: {} key action(s), {} travel entr(ies), {} macro(s)",
-        config.actions.len(),
-        config.travel.len(),
-        config.macros.len()
-    );
+    println!("ok: {}", config.summary());
     Ok(())
 }
 
 pub fn run_apply(api: &HidApi, args: &HeWriteArgs) -> Result<()> {
+    pending::ensure_none()?;
     let config = load_config(&args.file)?;
-    for note in check_config(&config)? {
-        eprintln!("note: {note}");
-    }
+    let notes =
+        check_config(&config).with_context(|| format!("invalid config {}", args.file.display()))?;
     with_keyboard(api, &args.device, |kb| {
         let current = kb.state()?;
-        let plan = plan_changes(&config, &current)?;
+        let mut plan = plan_changes(&config, &current)?;
+        plan.notes.extend(notes);
         finish(kb, args, &current, &plan)
     })
 }
@@ -295,62 +360,77 @@ pub fn run_restore_backup(api: &HidApi, args: &HeWriteArgs) -> Result<()> {
                 here.pid
             );
         }
-        if identity.firmware != here.firmware {
-            eprintln!(
-                "note: the backup was taken on firmware {}, the keyboard runs {}",
-                identity.firmware, here.firmware
-            );
-        }
         let current = kb.state()?;
-        let plan = plan_restore(&current, &saved);
-        finish(kb, args, &current, &plan)
+        let mut plan = plan_restore(&current, &saved);
+        if identity.firmware != here.firmware {
+            plan.notes.push(format!(
+                "the backup was taken on firmware {}, the keyboard runs {}",
+                identity.firmware, here.firmware
+            ));
+        }
+        finish(kb, args, &current, &plan)?;
+        if !args.dry_run {
+            // The keyboard now holds the backup: any unfinished write is undone.
+            pending::end()?;
+        }
+        Ok(())
     })
 }
 
-fn finish(kb: &Keyboard, args: &HeWriteArgs, current: &State, plan: &Plan) -> Result<()> {
-    for note in &plan.notes {
-        eprintln!("note: {note}");
-    }
-    let backup = if args.dry_run || plan.is_empty() {
-        None
-    } else {
-        Some(kb.write_and_verify(current, plan)?)
-    };
-    report(args.json, &args.file, plan, args.dry_run, backup)
+enum Outcome {
+    NoChanges,
+    DryRun,
+    Written(PathBuf),
 }
 
-fn report(
-    as_json: bool,
-    file: &Path,
-    plan: &Plan,
-    dry_run: bool,
-    backup: Option<PathBuf>,
-) -> Result<()> {
-    let changes = plan.describe();
+/// Validate the plan's writes and the firmware in every case, so a dry run
+/// fails exactly where a real run would; then write unless it is a dry run.
+fn finish(kb: &Keyboard, args: &HeWriteArgs, current: &State, plan: &Plan) -> Result<()> {
+    if !plan.is_empty() {
+        kb.firmware.version.check_writes()?;
+        plan.writes(current)?;
+    }
+    let outcome = if plan.is_empty() {
+        Outcome::NoChanges
+    } else if args.dry_run {
+        Outcome::DryRun
+    } else {
+        Outcome::Written(kb.write_and_verify(current, plan)?)
+    };
+    report(args.json, &args.file, plan, &outcome)
+}
+
+fn report(as_json: bool, file: &Path, plan: &Plan, outcome: &Outcome) -> Result<()> {
+    let changes: Vec<String> = plan.changes.iter().map(ToString::to_string).collect();
     if as_json {
+        let (status, backup) = match outcome {
+            Outcome::NoChanges => ("no_changes", None),
+            Outcome::DryRun => ("dry_run", None),
+            Outcome::Written(path) => ("written", Some(path.display().to_string())),
+        };
         return print_json(&json!({
             "file": file.display().to_string(),
+            "status": status,
             "changes": changes,
             "notes": plan.notes,
-            "dry_run": dry_run,
-            "written": backup.is_some(),
-            "backup": backup.map(|p| p.display().to_string()),
+            "backup": backup,
         }));
     }
-    if changes.is_empty() {
-        println!(
-            "no changes: the keyboard already matches {}",
-            file.display()
-        );
-        return Ok(());
+    for note in &plan.notes {
+        eprintln!("note: {note}");
     }
     for line in &changes {
         println!("{line}");
     }
-    if dry_run {
-        println!("dry run: {} change(s), nothing written", changes.len());
-    } else {
-        println!("{} change(s) written and verified", changes.len());
+    match outcome {
+        Outcome::NoChanges => {
+            println!(
+                "no changes: the keyboard already matches {}",
+                file.display()
+            )
+        }
+        Outcome::DryRun => println!("dry run: {} change(s), nothing written", changes.len()),
+        Outcome::Written(_) => println!("{} change(s) written and verified", changes.len()),
     }
     Ok(())
 }

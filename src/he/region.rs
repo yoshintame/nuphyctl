@@ -31,112 +31,117 @@ pub enum Region {
     Macros,
 }
 
+/// How a region is laid out and written.
+struct Spec {
+    name: &'static str,
+    get_cmd: u8,
+    set_cmd: u8,
+    /// Bytes of one layer or one mode.
+    segment: usize,
+    segments: usize,
+    /// Writes cover whole entries: a key action, a travel record, a macro step.
+    unit: usize,
+    /// Bytes of a segment this tool writes; matrix bytes past the 128 slots
+    /// (the G keys) are never written.
+    writable: usize,
+}
+
+static SPECS: [Spec; 3] = [
+    Spec {
+        name: "key matrix",
+        get_cmd: 8,
+        set_cmd: 9,
+        segment: LAYER_BYTES,
+        segments: LAYERS as usize,
+        unit: ACTION_LEN,
+        writable: MATRIX_SLOTS * ACTION_LEN,
+    },
+    Spec {
+        name: "travel",
+        get_cmd: 160,
+        set_cmd: 161,
+        segment: TRAVEL_BYTES,
+        segments: MODES as usize,
+        unit: TRAVEL_RECORD,
+        writable: TRAVEL_BYTES,
+    },
+    Spec {
+        name: "macros",
+        get_cmd: 12,
+        set_cmd: 13,
+        segment: MACRO_BYTES,
+        segments: MODES as usize,
+        unit: 4,
+        writable: MACRO_BYTES,
+    },
+];
+
 impl Region {
     pub const ALL: [Self; 3] = [Self::Matrix, Self::Travel, Self::Macros];
 
-    pub const fn index(self) -> usize {
-        self as usize
+    const fn spec(self) -> &'static Spec {
+        &SPECS[self as usize]
     }
 
     pub const fn len(self) -> usize {
-        self.segment() * self.segments()
+        self.spec().segment * self.spec().segments
     }
 
     pub const fn get_cmd(self) -> u8 {
-        match self {
-            Self::Matrix => 8,
-            Self::Macros => 12,
-            Self::Travel => 160,
-        }
+        self.spec().get_cmd
     }
 
     pub const fn set_cmd(self) -> u8 {
-        match self {
-            Self::Matrix => 9,
-            Self::Macros => 13,
-            Self::Travel => 161,
-        }
+        self.spec().set_cmd
     }
 
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::Matrix => "key matrix",
-            Self::Travel => "travel",
-            Self::Macros => "macros",
-        }
+        self.spec().name
     }
 
-    /// One layer or one mode.
-    const fn segment(self) -> usize {
-        match self {
-            Self::Matrix => LAYER_BYTES,
-            Self::Travel => TRAVEL_BYTES,
-            Self::Macros => MACRO_BYTES,
-        }
-    }
-
-    const fn segments(self) -> usize {
-        match self {
-            Self::Matrix => LAYERS as usize,
-            Self::Travel | Self::Macros => MODES as usize,
-        }
-    }
-
-    /// Writes cover whole entries: a key action, a travel record, a macro step.
-    const fn unit(self) -> usize {
-        match self {
-            Self::Matrix => ACTION_LEN,
-            Self::Travel => TRAVEL_RECORD,
-            Self::Macros => 4,
-        }
-    }
-
-    /// Bytes of a segment this tool writes. Matrix bytes past the 128 slots
-    /// (the G keys) are never written.
-    const fn writable(self) -> Range<usize> {
-        match self {
-            Self::Matrix => 0..MATRIX_SLOTS * ACTION_LEN,
-            Self::Travel | Self::Macros => 0..self.segment(),
-        }
+    /// Start offsets of every entry this tool may write, in address order.
+    fn writable_entries(self) -> impl Iterator<Item = usize> {
+        let spec = self.spec();
+        (0..spec.segments).flat_map(move |s| {
+            let base = s * spec.segment;
+            (base..base + spec.writable).step_by(spec.unit)
+        })
     }
 
     pub fn is_writable_at(self, offset: usize) -> bool {
-        offset < self.len() && self.writable().contains(&(offset % self.segment()))
+        let spec = self.spec();
+        offset < self.len() && offset % spec.segment < spec.writable
     }
 
-    /// The rules every write to this region must pass, whoever planned it.
+    /// The rules every write to this region must pass, whoever planned it:
+    /// whole entries, aligned within their layer or mode (a 512-byte layer
+    /// is not a multiple of a 3-byte action), inside the writable bytes of
+    /// one segment, and no action that is never written.
     pub fn check_write(self, addr: u16, data: &[u8]) -> Result<()> {
+        let spec = self.spec();
         let addr = usize::from(addr);
-        let unit = self.unit();
         if data.is_empty() || data.len() > CHUNK {
+            bail!("{} write of {} bytes (1..={CHUNK})", spec.name, data.len());
+        }
+        let within = addr % spec.segment;
+        if !within.is_multiple_of(spec.unit) || !data.len().is_multiple_of(spec.unit) {
             bail!(
-                "{} write of {} bytes (1..={CHUNK})",
-                self.name(),
-                data.len()
+                "{} writes cover whole {}-byte entries",
+                spec.name,
+                spec.unit
             );
         }
-        let end = addr + data.len();
-        let segment = self.segment();
-        let start_in = addr % segment;
-        // Entries are aligned within their layer or mode: a 512-byte layer
-        // is not a multiple of a 3-byte action.
-        if !start_in.is_multiple_of(unit) || !data.len().is_multiple_of(unit) {
-            bail!("{} writes cover whole {unit}-byte entries", self.name());
-        }
-        if end > self.len()
-            || addr / segment != (end - 1) / segment
-            || !self.writable().contains(&start_in)
-            || start_in + data.len() > self.writable().end
-        {
+        if addr + data.len() > self.len() || within + data.len() > spec.writable {
             bail!(
-                "{} write at {addr}..{end} leaves the writable bytes",
-                self.name()
+                "{} write at {addr}..{} leaves the writable bytes",
+                spec.name,
+                addr + data.len()
             );
         }
         if self == Self::Matrix {
             for b in data.chunks(ACTION_LEN) {
                 let action = Action([b[0], b[1], b[2]]);
-                if action.is_forbidden() {
+                if action.never_write() {
                     bail!("refusing to assign {action} to a key");
                 }
             }
@@ -168,30 +173,25 @@ pub struct WriteChunk {
 /// entries that differ, adjacent ones sharing a packet, never across a layer
 /// or mode.
 pub fn diff_writes(region: Region, current: &[u8], want: &[u8]) -> Vec<WriteChunk> {
-    let unit = region.unit();
-    let max = CHUNK / unit * unit;
+    let spec = region.spec();
+    let max = CHUNK / spec.unit * spec.unit;
     let mut chunks: Vec<WriteChunk> = Vec::new();
-    let writable = region.writable();
-    let entries = (0..region.segments()).flat_map(|s| {
-        let base = s * region.segment();
-        (base + writable.start..base + writable.end).step_by(unit)
-    });
-    for at in entries {
-        if current[at..at + unit] == want[at..at + unit] {
+    for at in region.writable_entries() {
+        let entry = at..at + spec.unit;
+        if current[entry.clone()] == want[entry.clone()] {
             continue;
         }
-        let entry = &want[at..at + unit];
         match chunks.last_mut() {
             Some(c)
                 if usize::from(c.addr) + c.data.len() == at
-                    && c.data.len() + unit <= max
-                    && usize::from(c.addr) / region.segment() == at / region.segment() =>
+                    && c.data.len() + spec.unit <= max
+                    && usize::from(c.addr) / spec.segment == at / spec.segment =>
             {
-                c.data.extend_from_slice(entry)
+                c.data.extend_from_slice(&want[entry])
             }
             _ => chunks.push(WriteChunk {
                 addr: at as u16,
-                data: entry.to_vec(),
+                data: want[entry].to_vec(),
             }),
         }
     }

@@ -11,9 +11,9 @@
 //! 20  ..  key matrix, travel, macros
 //! ```
 
-use crate::he::plan::State;
 use crate::he::protocol::FirmwareVersion;
 use crate::he::region::Region;
+use crate::he::state::State;
 use anyhow::{Result, bail};
 
 const MAGIC: &[u8; 12] = b"nuphyctl-he\0";
@@ -35,7 +35,7 @@ pub fn encode(identity: Identity, state: &State) -> Vec<u8> {
     out.push(0);
     out.extend_from_slice(&identity.vid.to_le_bytes());
     out.extend_from_slice(&identity.pid.to_le_bytes());
-    out.extend_from_slice(&identity.firmware.0.to_le_bytes());
+    out.extend_from_slice(&identity.firmware.to_u16().to_le_bytes());
     for region in Region::ALL {
         out.extend_from_slice(state.region(region));
     }
@@ -56,7 +56,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Identity, State)> {
     let identity = Identity {
         vid: word(14),
         pid: word(16),
-        firmware: FirmwareVersion(word(18)),
+        firmware: FirmwareVersion::from_u16(word(18)),
     };
     let body = &bytes[HEADER..];
     let expected: usize = Region::ALL.iter().map(|r| r.len()).sum();
@@ -69,20 +69,20 @@ pub fn decode(bytes: &[u8]) -> Result<(Identity, State)> {
         at += r.len();
         part
     });
-    Ok((identity, State::new(regions)?))
+    Ok((identity, State::from_regions(regions)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::he::plan::tests::blank_state;
+    use crate::he::testutil::blank_state;
 
     #[test]
     fn round_trips_and_rejects_strangers() {
         let id = Identity {
             vid: 0x19f5,
             pid: 0xfee0,
-            firmware: FirmwareVersion(0x120),
+            firmware: FirmwareVersion::Bcd(0x120),
         };
         let state = blank_state();
         let bytes = encode(id, &state);

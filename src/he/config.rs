@@ -1,13 +1,16 @@
 //! The declarative config: parsing, offline checks and export.
 //!
 //! ```toml
-//! [m1.base]                 # mode m1..m3 . base | fn1 | fn2 | fn3 (or fn0..fn11)
+//! [m1.base]                 # mode m1..m3 . layer, numbered across modes as in NuPhy IO
 //! CAPS = "FN(2)"            # momentary layer, absolute number
 //! "#58" = "LCTL+C"
 //!
+//! [m2.fn5]                  # m2's layers: base (fn4), fn5, fn6, fn7
+//! I = "UP"
+//!
 //! [m1.travel]               # millimetres; unset fields keep the keyboard's value
-//! "*" = { actuation = 1.5, trigger = "normal" }
-//! W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
+//! "*" = { trigger = "normal", actuation = 1.5 }
+//! W = { trigger = "rapid", actuation = 0.5, press = 0.1, release = 0.1 }
 //!
 //! [m1.macros]               # 1..32 as in NuPhy IO; a chord, or steps with delays
 //! 1 = "LCTL+Z"
@@ -16,36 +19,66 @@
 
 use crate::he::actions::Action;
 use crate::he::layout::{
-    LAYER_NAMES, key_count, mode_label, parse_layer, parse_mode, parse_position, position_name,
+    KeyRef, MacroRef, TravelRef, key_count, layer_name, mode_label, parse_layer, parse_mode,
+    parse_position, position_name,
 };
 use crate::he::macros::{Macro, encode_region};
-use crate::he::plan::{State, action_in};
 use crate::he::region::{LAYERS_PER_MODE, MACRO_COUNT, MODES};
-use crate::he::travel::{TravelRecord, TravelSpec};
+use crate::he::state::{Matrix, State};
+use crate::he::travel::TravelSpec;
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-/// What a config asks for, keyed by mode (0-based), layer, slot and macro
-/// index (0-based).
+/// A mode's travel section: `"*"` for every key, and keys of their own on
+/// top of it, field by field.
 #[derive(Debug, Default)]
-pub struct Config {
-    pub actions: BTreeMap<(u8, u8, usize), Action>,
-    pub travel: BTreeMap<(u8, usize), TravelSpec>,
-    pub macros: BTreeMap<(u8, usize), Macro>,
+pub struct TravelSection {
+    pub all: TravelSpec,
+    pub keys: BTreeMap<usize, TravelSpec>,
 }
 
-/// Where each canonical entry came from, so two spellings of the same key
-/// (`1` and `01`, `[m1.travel]` and `[1.travel]`) are an error.
-#[derive(Default)]
-struct Sources(HashMap<String, String>);
+impl TravelSection {
+    /// What the section asks of one key, if anything.
+    pub fn spec(&self, slot: usize) -> Option<TravelSpec> {
+        let spec = self
+            .all
+            .merged(self.keys.get(&slot).copied().unwrap_or_default());
+        (spec != TravelSpec::default()).then_some(spec)
+    }
 
-impl Sources {
-    fn claim(&mut self, canonical: String, source: &str) -> Result<()> {
-        if let Some(previous) = self.0.insert(canonical, source.to_string()) {
-            bail!("{source} sets the same thing as {previous}");
-        }
-        Ok(())
+    /// The written entries with their labels: `"*"`, then each key.
+    fn entries(&self, mode: u8) -> impl Iterator<Item = (String, &TravelSpec)> {
+        let all = (self.all != TravelSpec::default())
+            .then(|| (format!("{}.travel \"*\"", mode_label(mode)), &self.all));
+        all.into_iter().chain(
+            self.keys
+                .iter()
+                .map(move |(&slot, spec)| (TravelRef { mode, slot }.to_string(), spec)),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Config {
+    pub actions: BTreeMap<KeyRef, Action>,
+    pub travel: BTreeMap<u8, TravelSection>,
+    pub macros: BTreeMap<MacroRef, Macro>,
+}
+
+impl Config {
+    /// One line for `check`: what the file sets.
+    pub fn summary(&self) -> String {
+        let travel: usize = self
+            .travel
+            .iter()
+            .map(|(&mode, section)| section.entries(mode).count())
+            .sum();
+        format!(
+            "{} key action(s), {travel} travel entr(ies), {} macro(s)",
+            self.actions.len(),
+            self.macros.len()
+        )
     }
 }
 
@@ -55,10 +88,21 @@ pub fn load_config(path: &Path) -> Result<Config> {
     parse_config(&text).with_context(|| format!("invalid config {}", path.display()))
 }
 
+/// Two spellings of one thing (`ESC` and `ESCAPE`, `1` and `01`, `[m1.travel]`
+/// and `[1.travel]`) are an error naming both.
+fn claim<K: Ord>(seen: &mut BTreeMap<K, String>, key: K, source: &str) -> Result<()> {
+    if let Some(previous) = seen.insert(key, source.to_string()) {
+        bail!("{source} sets the same thing as {previous}");
+    }
+    Ok(())
+}
+
 pub fn parse_config(text: &str) -> Result<Config> {
     let table: toml::Table = text.parse().context("invalid TOML")?;
     let mut config = Config::default();
-    let mut sources = Sources::default();
+    let mut actions_seen = BTreeMap::new();
+    let mut macros_seen = BTreeMap::new();
+    let mut travel_seen = BTreeMap::new();
     for (mode_key, sections) in &table {
         let mode = parse_mode(mode_key).with_context(|| format!("in [{mode_key}]"))?;
         let sections = sections
@@ -71,22 +115,38 @@ pub fn parse_config(text: &str) -> Result<Config> {
             let at = format!("{mode_key}.{section}");
             match section.as_str() {
                 "travel" => {
-                    sources.claim(format!("{mode}.travel"), &format!("[{at}]"))?;
-                    parse_travel(mode, &at, entries, &mut config)?;
+                    claim(&mut travel_seen, mode, &format!("[{at}]"))?;
+                    config.travel.insert(mode, parse_travel(&at, entries)?);
                 }
-                "macros" => parse_macros(mode, &at, entries, &mut config, &mut sources)?,
+                "macros" => {
+                    for (key, value) in entries {
+                        let source = format!("{at}.{key}");
+                        let index = key
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|n| (1..=MACRO_COUNT).contains(n))
+                            .with_context(|| {
+                                format!("{source}: macro numbers are 1..={MACRO_COUNT}")
+                            })?
+                            - 1;
+                        let at = MacroRef { mode, index };
+                        claim(&mut macros_seen, at, &source)?;
+                        config.macros.insert(at, Macro::parse(value, &source)?);
+                    }
+                }
                 _ => {
                     let layer = parse_layer(mode, section).with_context(|| format!("in [{at}]"))?;
                     for (key, value) in entries {
                         let source = format!("{at}.{key}");
                         let slot = parse_position(key).with_context(|| format!("in {source}"))?;
-                        sources.claim(format!("{mode}.{layer}.{slot}"), &source)?;
+                        let at = KeyRef { mode, layer, slot };
+                        claim(&mut actions_seen, at, &source)?;
                         let text = value.as_str().with_context(|| {
                             format!("{source} must be an action string like \"ESC\"")
                         })?;
                         let action: Action =
                             text.parse().with_context(|| format!("in {source}"))?;
-                        config.actions.insert((mode, layer, slot), action);
+                        config.actions.insert(at, action);
                     }
                 }
             }
@@ -95,97 +155,53 @@ pub fn parse_config(text: &str) -> Result<Config> {
     Ok(config)
 }
 
-fn parse_macros(
-    mode: u8,
-    at: &str,
-    entries: &toml::Table,
-    config: &mut Config,
-    sources: &mut Sources,
-) -> Result<()> {
+fn parse_travel(at: &str, entries: &toml::Table) -> Result<TravelSection> {
+    let mut section = TravelSection::default();
     for (key, value) in entries {
         let source = format!("{at}.{key}");
-        let index = key
-            .parse::<usize>()
-            .ok()
-            .filter(|n| (1..=MACRO_COUNT).contains(n))
-            .with_context(|| format!("{source}: macro numbers are 1..={MACRO_COUNT}"))?
-            - 1;
-        sources.claim(format!("{mode}.macro.{index}"), &source)?;
-        config
-            .macros
-            .insert((mode, index), Macro::parse(value, &source)?);
-    }
-    Ok(())
-}
-
-fn parse_travel(mode: u8, at: &str, entries: &toml::Table, config: &mut Config) -> Result<()> {
-    let all = match entries.get("*") {
-        Some(v) => TravelSpec::parse(v, &format!("{at}.\"*\""))?,
-        None => TravelSpec::default(),
-    };
-    let mut per_key: BTreeMap<usize, TravelSpec> = BTreeMap::new();
-    for (key, value) in entries.iter().filter(|(k, _)| k.as_str() != "*") {
-        let source = format!("{at}.{key}");
+        let spec = TravelSpec::parse(value, &source)?;
+        if key == "*" {
+            section.all = spec;
+            continue;
+        }
         let slot = parse_position(key).with_context(|| format!("in {source}"))?;
-        if per_key
-            .insert(slot, TravelSpec::parse(value, &source)?)
-            .is_some()
-        {
+        if section.keys.insert(slot, spec).is_some() {
             bail!("{source} names a key twice");
         }
     }
-    for slot in 0..key_count() {
-        let spec = all.merged(per_key.get(&slot).copied().unwrap_or_default());
-        if spec != TravelSpec::default() {
-            config.travel.insert((mode, slot), spec);
-        }
-    }
-    Ok(())
+    Ok(section)
 }
 
 /// Offline checks: travel entries must fit a record, macros must fit their
 /// region. Returns notes about what only the keyboard can settle.
 pub fn check_config(config: &Config) -> Result<Vec<String>> {
-    // Stock records with 0.01, 0.005 and 0.001 mm Rapid Trigger steps: a
-    // press or release value only has to fit one of them; which one the
-    // keyboard uses is known only at apply.
-    let stocks = [0x00, 0x0a, 0x14].map(|steps| TravelRecord([0xa2, 0, 0x95, steps, 0, 0, 0, 0]));
     let mut notes = Vec::new();
-    for (&(mode, slot), spec) in &config.travel {
-        let at = format!("{}.travel {}", mode_label(mode), position_name(slot));
-        if let Err(err) = spec.apply_to(stocks[0]) {
-            if !spec.sets_sensitivity() || !stocks[1..].iter().any(|r| spec.apply_to(*r).is_ok()) {
-                return Err(err.context(at));
+    for (&mode, section) in &config.travel {
+        for (at, spec) in section.entries(mode) {
+            if let Some(note) = spec.check_offline().with_context(|| at.clone())? {
+                notes.push(format!("{at}: {note}"));
             }
-            notes.push(format!(
-                "{at}: press/release need a finer Rapid Trigger step than 0.01 mm; apply fails unless the key uses one"
-            ));
         }
     }
     for mode in 0..MODES {
         let mut list = vec![Macro::default(); MACRO_COUNT];
-        for (&(_, index), m) in config.macros.range((mode, 0)..(mode, MACRO_COUNT)) {
-            list[index] = m.clone();
+        for (at, m) in config.macros.iter().filter(|(at, _)| at.mode == mode) {
+            list[at.index] = m.clone();
         }
         encode_region(&list).with_context(|| format!("{}.macros", mode_label(mode)))?;
     }
-    for (&(mode, layer, slot), a) in &config.actions {
-        let at = format!(
-            "{}.{} {} = {a}",
-            mode_label(mode),
-            LAYER_NAMES[usize::from(layer)],
-            position_name(slot)
-        );
-        if !a.is_writable() {
+    for (at, a) in &config.actions {
+        if !a.may_assign() {
             notes.push(format!(
-                "{at}: not written by this tool; apply passes only if the keyboard already holds it"
+                "{at} = {a}: {}; apply passes only if the keyboard already holds it",
+                a.unmanaged_reason()
             ));
         }
         if let Some(target) = a.layer()
-            && target / LAYERS_PER_MODE != mode
+            && target / LAYERS_PER_MODE != at.mode
         {
             notes.push(format!(
-                "{at}: FN(n) is absolute and layer {target} belongs to {}",
+                "{at} = {a}: FN(n) is absolute and layer {target} belongs to {}",
                 mode_label(target / LAYERS_PER_MODE)
             ));
         }
@@ -195,32 +211,31 @@ pub fn check_config(config: &Config) -> Result<Vec<String>> {
 
 /// The given modes as a config: actions that differ from the factory matrix,
 /// macros, and the travel table as a `"*"` default plus per-key differences.
-pub fn export_config(modes: &[u8], state: &State, factory_matrix: &[u8]) -> String {
+pub fn export_config(modes: &[u8], state: &State, factory: &Matrix) -> String {
     let mut out = String::from(
         "# nuphyctl he: key actions that differ from the factory matrix, macros, and key travel (mm)\n# apply with: nuphyctl he apply <this file>\n",
     );
     for &mode in modes {
         let m = mode_label(mode);
         for layer in 0..LAYERS_PER_MODE {
-            let changed: Vec<usize> = (0..key_count())
-                .filter(|&s| {
-                    state.action(mode, layer, s) != action_in(factory_matrix, mode, layer, s)
-                })
+            let changed: Vec<KeyRef> = (0..key_count())
+                .map(|slot| KeyRef { mode, layer, slot })
+                .filter(|&at| state.matrix.action(at) != factory.action(at))
                 .collect();
             if changed.is_empty() {
                 continue;
             }
-            out.push_str(&format!("\n[{m}.{}]\n", LAYER_NAMES[usize::from(layer)]));
-            for slot in changed {
+            out.push_str(&format!("\n[{m}.{}]\n", layer_name(mode, layer)));
+            for at in changed {
                 out.push_str(&format!(
                     "{} = \"{}\"  # factory {}\n",
-                    toml_key(&position_name(slot)),
-                    state.action(mode, layer, slot),
-                    action_in(factory_matrix, mode, layer, slot)
+                    toml_key(&position_name(at.slot)),
+                    state.matrix.action(at),
+                    factory.action(at)
                 ));
             }
         }
-        match state.macros(mode) {
+        match state.macros.macros(mode) {
             Ok(list) if list.iter().any(|mac| !mac.0.is_empty()) => {
                 out.push_str(&format!("\n[{m}.macros]\n"));
                 for (index, mac) in list.iter().enumerate().filter(|(_, mac)| !mac.0.is_empty()) {
@@ -231,7 +246,7 @@ pub fn export_config(modes: &[u8], state: &State, factory_matrix: &[u8]) -> Stri
             Err(err) => out.push_str(&format!("\n# [{m}.macros] left out: {err:#}\n")),
         }
         let specs: Vec<TravelSpec> = (0..key_count())
-            .map(|s| TravelSpec::of(&state.travel(mode, s)))
+            .map(|slot| TravelSpec::of(&state.travel.record(TravelRef { mode, slot })))
             .collect();
         let mut counts: Vec<(TravelSpec, usize)> = Vec::new();
         for spec in &specs {
@@ -267,23 +282,53 @@ fn toml_key(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::he::plan::plan_changes;
-    use crate::he::plan::tests::{SAMPLE, blank_state};
-    use crate::he::travel::Trigger;
+    use crate::he::region::Region;
+    use crate::he::testutil::{SAMPLE, blank_state};
+    use crate::he::travel::{FieldId, Trigger};
 
     #[test]
     fn parses_config() {
         let c = parse_config(SAMPLE).unwrap();
-        assert_eq!(c.actions[&(0, 0, 28)], Action([0xf0, 0xff, 2]));
-        assert_eq!(c.actions[&(0, 0, 58)], Action([0x10, 0x01, 0x06]));
-        assert_eq!(c.actions[&(0, 2, 22)].to_string(), "UP");
-        assert_eq!(c.travel.len(), 61);
-        let w = c.travel[&(0, 16)];
-        assert_eq!(w.lengths[0], Some(500));
+        let key = |mode, layer, slot| c.actions[&KeyRef { mode, layer, slot }];
+        assert_eq!(key(0, 0, 28), Action([0xf0, 0xff, 2]));
+        assert_eq!(key(0, 0, 58), Action([0x10, 0x01, 0x06]));
+        assert_eq!(key(0, 2, 22).to_string(), "UP");
+        let travel = &c.travel[&0];
+        assert_eq!(travel.keys.len(), 1);
+        let w = travel.spec(16).unwrap();
+        assert_eq!(w.length(FieldId::Actuation), Some(500));
         assert_eq!(w.trigger, Some(Trigger::Rapid));
-        assert_eq!(w.lengths[1], Some(100));
-        assert_eq!(c.travel[&(0, 0)].lengths[0], Some(1500));
-        assert_eq!(c.travel[&(0, 0)].trigger, None);
-        assert_eq!(c.macros[&(0, 0)], Macro::chord("LCTL+Z").unwrap());
+        assert_eq!(w.length(FieldId::Press), Some(100));
+        assert_eq!(
+            travel.spec(0).unwrap().length(FieldId::Actuation),
+            Some(1500)
+        );
+        assert_eq!(travel.spec(0).unwrap().trigger, None);
+        assert_eq!(
+            c.macros[&MacroRef { mode: 0, index: 0 }],
+            Macro::chord("LCTL+Z").unwrap()
+        );
+        assert_eq!(
+            c.summary(),
+            "3 key action(s), 2 travel entr(ies), 1 macro(s)"
+        );
+    }
+
+    #[test]
+    fn layers_are_numbered_across_modes() {
+        let c = parse_config("[m2.fn5]\nI = \"UP\"\n[m2.base]\nQ = \"A\"").unwrap();
+        assert!(c.actions.contains_key(&KeyRef {
+            mode: 1,
+            layer: 1,
+            slot: 22
+        }));
+        assert!(c.actions.contains_key(&KeyRef {
+            mode: 1,
+            layer: 0,
+            slot: 15
+        }));
+        assert!(parse_config("[m2.fn1]\nI = \"UP\"").is_err());
+        assert!(parse_config("[m2.fn4]\nQ = \"A\"\n[m2.base]\nQ = \"B\"").is_err());
     }
 
     #[test]
@@ -299,6 +344,7 @@ mod tests {
             "[m1.travel]\nW = { actuation = \"x\" }",
             "[m1.travel]\nW = { speed = 1 }",
             "[m1.travel]\nW = { trigger = 16 }",
+            "[m1.travel]\nW = { actuation = 1 }\nESCAPE = { actuation = 1 }\nESC = { actuation = 2 }",
             "[m1.travel]\nW = { actuation = 1 }\n[1.travel]\nQ = { actuation = 1 }",
             "[m1.macros]\n33 = \"LCTL+C\"",
             "[m1.macros]\n0 = \"LCTL+C\"",
@@ -316,10 +362,11 @@ mod tests {
         assert_eq!(check("[m2.base]\nS = \"0x950020\"").unwrap().len(), 1);
         assert!(check("[m2.base]\nCAPS = \"FN(1)\"").unwrap()[0].contains("belongs to m1"));
         assert!(check("[m2.base]\nCAPS = \"FN(5)\"").unwrap().is_empty());
-        assert!(check("[m1.travel]\nW = { press = 0.105 }").unwrap()[0].contains("finer"));
+        let notes = check("[m1.travel]\n\"*\" = { press = 0.105 }").unwrap();
+        assert_eq!(notes.len(), 1, "a \"*\" entry is checked once: {notes:?}");
+        assert!(notes[0].contains("finer"));
         assert!(check("[m1.travel]\nW = { actuation = 3.5 }").is_err());
         assert!(parse_config("[m1.travel]\nW = { press = 0.0013 }").is_err());
-        assert!(check("[m1.travel]\nW = { press = 0.003 }").unwrap()[0].contains("finer"));
     }
 
     #[test]
@@ -328,17 +375,36 @@ mod tests {
         let mut state = plan_changes(&parse_config(SAMPLE).unwrap(), &factory)
             .unwrap()
             .want;
-        let mut odd = state.travel(0, 1);
+        let one = TravelRef { mode: 0, slot: 1 };
+        let mut odd = state.travel.record(one);
         odd.set_trigger(Trigger::Raw(3));
-        state.set_travel(0, 1, odd);
-        state.set_action(0, 3, 0, Action([0xf0, 0xff, 12]));
-        state.set_action(0, 3, 1, Action([0x70, 40, 0xff]));
-
-        let text = export_config(
-            &[0],
-            &state,
-            factory.region(crate::he::region::Region::Matrix),
+        state.travel.set_record(one, odd);
+        state.matrix.set_action(
+            KeyRef {
+                mode: 0,
+                layer: 3,
+                slot: 0,
+            },
+            Action([0xf0, 0xff, 12]),
         );
+        state.matrix.set_action(
+            KeyRef {
+                mode: 0,
+                layer: 3,
+                slot: 1,
+            },
+            Action([0x70, 40, 0xff]),
+        );
+        state.matrix.set_action(
+            KeyRef {
+                mode: 1,
+                layer: 1,
+                slot: 0,
+            },
+            Action([0x10, 0, 0x2b]),
+        );
+
+        let text = export_config(&[0, 1], &state, &factory.matrix);
         assert!(text.contains("[m1.base]\nCAPS = \"FN(2)\""), "{text}");
         assert!(text.contains("[m1.macros]\n1 = \"LCTL+Z\""), "{text}");
         assert!(
@@ -351,6 +417,7 @@ mod tests {
         );
         assert!(text.contains("\"1\" = { trigger = 3 }"), "{text}");
         assert!(text.contains("ESC = \"0xf0ff0c\""), "{text}");
+        assert!(text.contains("[m2.fn5]\nESC = \"TAB\""), "{text}");
 
         let config = parse_config(&text).unwrap();
         assert!(plan_changes(&config, &state).unwrap().is_empty());
@@ -361,20 +428,9 @@ mod tests {
         let mut state = blank_state();
         let mut list = vec![Macro::default(); MACRO_COUNT];
         list[0] = Macro::chord("LCTL+C").unwrap();
-        state.set_macros(1, &list).unwrap();
-        let mut bytes = state.region(crate::he::region::Region::Macros).to_vec();
-        bytes[0] = 3;
-        let state = State::new([
-            state.region(crate::he::region::Region::Matrix).to_vec(),
-            state.region(crate::he::region::Region::Travel).to_vec(),
-            bytes,
-        ])
-        .unwrap();
-        let text = export_config(
-            &[0, 1],
-            &state,
-            state.region(crate::he::region::Region::Matrix),
-        );
+        state.macros.set_macros(1, &list).unwrap();
+        state.region_mut(Region::Macros)[0] = 3;
+        let text = export_config(&[0, 1], &state, &state.matrix);
         assert!(text.contains("# [m1.macros] left out"), "{text}");
         assert!(text.contains("[m2.macros]\n1 = \"LCTL+C\""), "{text}");
     }

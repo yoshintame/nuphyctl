@@ -13,6 +13,7 @@ use crate::keymap::{
     diff_assignments, diff_keymaps, export_config, parse_config, parse_layer_spec, plan_writes,
 };
 use crate::nuphy_protocol::{KeyboardProtocol, format_firmware_version};
+use crate::output::print_json;
 use anyhow::{Context, Result, bail};
 use hidapi::HidApi;
 use serde_json::{Value, json};
@@ -135,11 +136,6 @@ fn backup_keymap(keymap: &Keymap) -> Result<PathBuf> {
     let dir = default_backup_dir()?;
     write_backup(&dir, "keymap", &keymap.bytes)
         .context("failed to save keymap backup; nothing was written")
-}
-
-pub(crate) fn print_json(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
 }
 
 fn code_json(code: u16) -> Value {

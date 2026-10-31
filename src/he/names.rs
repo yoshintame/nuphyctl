@@ -24,7 +24,10 @@ pub fn usage_name(usage: u8) -> Option<&'static str> {
 
 /// Name of the modifier at `bit` (0 = `LCTL` .. 7 = `RGUI`).
 pub fn modifier_name(bit: u32) -> &'static str {
-    lookup_code(FIRST_MODIFIER + bit as u16).map_or("?", |k| k.name)
+    assert!(bit < 8, "a modifier bit is 0..8");
+    lookup_code(FIRST_MODIFIER + bit as u16)
+        .expect("the keycode catalogue names LCTL..RGUI")
+        .name
 }
 
 /// Names of the modifiers set in `mask`, in bit order.
@@ -45,6 +48,37 @@ pub fn parse_key(input: &str) -> Result<Key> {
         bail!("{input:?} is not a keyboard key");
     }
     Ok(Key::Usage(k.code as u8))
+}
+
+/// `LCTL+LSFT+Z`: modifiers in the order written and at most one key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chord {
+    /// One bit each, as written.
+    pub modifiers: Vec<u8>,
+    pub usage: Option<u8>,
+}
+
+impl Chord {
+    pub fn modifier_mask(&self) -> u8 {
+        self.modifiers.iter().fold(0, |m, b| m | b)
+    }
+}
+
+pub fn parse_chord(input: &str) -> Result<Chord> {
+    let mut chord = Chord {
+        modifiers: Vec::new(),
+        usage: None,
+    };
+    for part in input.split('+') {
+        match parse_key(part).with_context(|| format!("in {input:?}"))? {
+            Key::Modifier(bit) => chord.modifiers.push(bit),
+            Key::Usage(_) if chord.usage.is_some() => {
+                bail!("{input:?}: a chord is modifiers and at most one key")
+            }
+            Key::Usage(u) => chord.usage = Some(u),
+        }
+    }
+    Ok(chord)
 }
 
 /// `NAME(args)` with a case-insensitive name: the trimmed `args`.
@@ -84,6 +118,18 @@ mod tests {
         assert!(parse_key("VOLU").is_err());
         assert_eq!(usage_name(0x2c), Some("SPC"));
         assert_eq!(modifier_names(0x05).collect::<Vec<_>>(), ["LCTL", "LALT"]);
+    }
+
+    #[test]
+    fn chords() {
+        let c = parse_chord("LSFT+lctl+Z").unwrap();
+        assert_eq!(c.modifiers, vec![0x02, 0x01]);
+        assert_eq!(c.modifier_mask(), 0x03);
+        assert_eq!(c.usage, Some(0x1d));
+        assert_eq!(parse_chord("RALT").unwrap().usage, None);
+        assert!(parse_chord("A+B").is_err());
+        assert!(parse_chord("VOLU").is_err());
+        assert!(parse_chord("").is_err());
     }
 
     #[test]

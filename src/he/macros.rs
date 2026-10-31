@@ -10,8 +10,10 @@
 //! NuPhy IO lays macros out one after another from byte 64 and points unused
 //! entries at an empty step; [`encode_region`] does the same.
 
-use crate::he::names::{Key, call_args, modifier_name, parse_byte, parse_key, usage_name};
-pub use crate::he::region::{MACRO_BYTES, MACRO_COUNT};
+use crate::he::names::{
+    Key, call_args, modifier_name, parse_byte, parse_chord, parse_key, usage_name,
+};
+use crate::he::region::{MACRO_BYTES, MACRO_COUNT};
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
@@ -25,68 +27,104 @@ const KIND_MOUSE: u8 = 3;
 const KIND_MASK: u8 = 0x3f;
 const DOWN: u8 = 0x40;
 const LAST: u8 = 0x80;
+/// The one step of an empty macro.
+const EMPTY_STEP: [u8; STEP] = [0, 0, LAST, 0];
 
 /// The delay NuPhy IO puts after each step of a macro it creates, except the
 /// last; `"LCTL+C"` shorthand compiles to it.
 const CHORD_DELAY: u16 = 1;
 
+/// What a macro step presses or releases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Step {
-    pub kind: u8,
-    pub down: bool,
-    pub code: u8,
-    /// Wait after this step, in the firmware's units (milliseconds).
-    pub delay: u16,
+pub enum Target {
+    /// One modifier, as its bitmask bit.
+    Modifier(u8),
+    /// A HID keyboard usage.
+    Key(u8),
+    /// A mouse button mask.
+    Mouse(u8),
+    /// Any other kind and code, kept as they are.
+    Raw { kind: u8, code: u8 },
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Macro(pub Vec<Step>);
-
-impl Step {
-    /// What the step presses: `LCTL`, `C`, `MOUSE(1)` or raw `CODE(kind,code)`.
-    pub fn target_name(&self) -> String {
-        match (self.kind, self.code) {
-            (KIND_MODIFIER, mask) if mask.count_ones() == 1 => {
-                modifier_name(mask.trailing_zeros()).to_string()
-            }
-            (KIND_KEY, usage) if usage_name(usage).is_some() => {
-                usage_name(usage).unwrap_or_default().to_string()
-            }
-            (KIND_MOUSE, button) => format!("MOUSE({button})"),
-            (kind, code) => format!("CODE({kind},{code})"),
+impl Target {
+    /// The canonical target for a step's kind and code bytes.
+    pub fn from_bytes(kind: u8, code: u8) -> Self {
+        match (kind & KIND_MASK, code) {
+            (KIND_MODIFIER, bit) if bit.count_ones() == 1 => Self::Modifier(bit),
+            (KIND_KEY, usage) => Self::Key(usage),
+            (KIND_MOUSE, buttons) => Self::Mouse(buttons),
+            (kind, code) => Self::Raw { kind, code },
         }
     }
+
+    fn bytes(self) -> (u8, u8) {
+        match self {
+            Self::Modifier(bit) => (KIND_MODIFIER, bit),
+            Self::Key(usage) => (KIND_KEY, usage),
+            Self::Mouse(buttons) => (KIND_MOUSE, buttons),
+            Self::Raw { kind, code } => (kind, code),
+        }
+    }
+
+    /// A name `parse` reads back: `LCTL`, `C`, `MOUSE(1)` or `CODE(kind,code)`.
+    pub fn name(self) -> String {
+        match self {
+            Self::Modifier(bit) => modifier_name(bit.trailing_zeros()).to_string(),
+            Self::Key(usage) => usage_name(usage)
+                .map_or_else(|| format!("CODE({KIND_KEY},{usage})"), str::to_string),
+            Self::Mouse(buttons) => format!("MOUSE({buttons})"),
+            Self::Raw { kind, code } => format!("CODE({kind},{code})"),
+        }
+    }
+
+    /// Whether a chord (`LCTL+C`) can name it.
+    fn in_chord(self) -> bool {
+        match self {
+            Self::Modifier(_) => true,
+            Self::Key(usage) => usage_name(usage).is_some(),
+            _ => false,
+        }
+    }
+
+    fn parse(input: &str) -> Result<Self> {
+        if let Some(args) = call_args(input, "CODE") {
+            let (kind, code) = args
+                .split_once(',')
+                .with_context(|| format!("{input:?}: expected CODE(kind,code)"))?;
+            let kind = parse_byte(kind)?;
+            if kind > KIND_MASK {
+                bail!("{input:?}: a step kind is 0..={KIND_MASK}");
+            }
+            return Ok(Self::from_bytes(kind, parse_byte(code)?));
+        }
+        if let Some(args) = call_args(input, "MOUSE") {
+            return Ok(Self::Mouse(parse_byte(args)?));
+        }
+        Ok(match parse_key(input)? {
+            Key::Modifier(bit) => Self::Modifier(bit),
+            Key::Usage(usage) => Self::Key(usage),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub target: Target,
+    pub down: bool,
+    /// Wait after this step, in the firmware's units (milliseconds).
+    pub delay: u16,
 }
 
 impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let direction = if self.down { "down" } else { "up" };
-        write!(f, "{} {direction}", self.target_name())?;
+        write!(f, "{} {direction}", self.target.name())?;
         if self.delay != 0 {
             write!(f, " {}", self.delay)?;
         }
         Ok(())
     }
-}
-
-fn parse_target(input: &str) -> Result<(u8, u8)> {
-    if let Some(args) = call_args(input, "CODE") {
-        let (kind, code) = args
-            .split_once(',')
-            .with_context(|| format!("{input:?}: expected CODE(kind,code)"))?;
-        let kind = parse_byte(kind)?;
-        if !(1..=KIND_MASK).contains(&kind) {
-            bail!("{input:?}: a step kind is 1..={KIND_MASK}");
-        }
-        return Ok((kind, parse_byte(code)?));
-    }
-    if let Some(args) = call_args(input, "MOUSE") {
-        return Ok((KIND_MOUSE, parse_byte(args)?));
-    }
-    Ok(match parse_key(input)? {
-        Key::Modifier(bit) => (KIND_MODIFIER, bit),
-        Key::Usage(usage) => (KIND_KEY, usage),
-    })
 }
 
 impl std::str::FromStr for Step {
@@ -111,57 +149,56 @@ impl std::str::FromStr for Step {
             "up" => false,
             _ => bail!("macro step {input:?}: expected down or up"),
         };
-        let (kind, code) = parse_target(target).with_context(|| format!("in {input:?}"))?;
         Ok(Self {
-            kind,
+            target: Target::parse(target).with_context(|| format!("in {input:?}"))?,
             down,
-            code,
             delay,
         })
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Macro(pub Vec<Step>);
+
 impl Macro {
+    /// `steps` as a macro; the one step an empty macro is stored as reads as
+    /// no steps at all.
+    pub fn new(steps: Vec<Step>) -> Self {
+        let is_empty_step = |s: &Step| step_bytes(s, true) == EMPTY_STEP;
+        if steps.len() == 1 && is_empty_step(&steps[0]) {
+            return Self::default();
+        }
+        Self(steps)
+    }
+
     /// `"LCTL+C"`: modifiers down in order, the key down and up, modifiers up
     /// in reverse, with NuPhy IO's step delay and none after the last step.
     pub fn chord(input: &str) -> Result<Self> {
-        let mut mods = Vec::new();
-        let mut key = None;
-        for part in input.split('+') {
-            match parse_target(part.trim()).with_context(|| format!("in {input:?}"))? {
-                (KIND_MODIFIER, bit) => mods.push(bit),
-                (KIND_KEY, code) if key.is_none() => key = Some(code),
-                _ => bail!("{input:?}: a chord is modifiers and at most one key"),
-            }
-        }
-        let step = |kind, down, code| Step {
-            kind,
+        let chord = parse_chord(input)?;
+        let step = |target, down| Step {
+            target,
             down,
-            code,
             delay: CHORD_DELAY,
         };
-        let mut steps: Vec<Step> = mods.iter().map(|&m| step(KIND_MODIFIER, true, m)).collect();
-        if let Some(code) = key {
-            steps.push(step(KIND_KEY, true, code));
-            steps.push(step(KIND_KEY, false, code));
+        let mods = chord.modifiers.iter().map(|&bit| Target::Modifier(bit));
+        let mut steps: Vec<Step> = mods.clone().map(|t| step(t, true)).collect();
+        if let Some(usage) = chord.usage {
+            steps.push(step(Target::Key(usage), true));
+            steps.push(step(Target::Key(usage), false));
         }
-        steps.extend(mods.iter().rev().map(|&m| step(KIND_MODIFIER, false, m)));
+        steps.extend(mods.rev().map(|t| step(t, false)));
         if let Some(last) = steps.last_mut() {
             last.delay = 0;
         }
-        Ok(Self(steps))
+        Ok(Self::new(steps))
     }
 
     /// The shortest config value that reproduces this macro exactly.
     pub fn to_toml(&self) -> String {
-        if !self.0.is_empty() {
-            let pressed: Vec<String> = self
-                .0
-                .iter()
-                .filter(|s| s.down)
-                .map(Step::target_name)
-                .collect();
-            let shorthand = pressed.join("+");
+        let pressed: Vec<Target> = self.0.iter().filter(|s| s.down).map(|s| s.target).collect();
+        if !pressed.is_empty() && pressed.iter().all(|t| t.in_chord()) {
+            let names: Vec<String> = pressed.iter().map(|t| t.name()).collect();
+            let shorthand = names.join("+");
             if Self::chord(&shorthand).is_ok_and(|m| m == *self) {
                 return format!("\"{shorthand}\"");
             }
@@ -183,7 +220,7 @@ impl Macro {
                     })
                     .collect::<Result<Vec<_>>>()
                     .with_context(|| format!("in {source}"))?;
-                Ok(Self(steps))
+                Ok(Self::new(steps))
             }
             _ => bail!("{source} must be a chord like \"LCTL+C\" or a list of steps"),
         }
@@ -191,8 +228,10 @@ impl Macro {
 }
 
 fn step_bytes(s: &Step, last: bool) -> [u8; STEP] {
-    let flags = (s.kind & KIND_MASK) | if s.down { DOWN } else { 0 } | if last { LAST } else { 0 };
-    [s.delay as u8, (s.delay >> 8) as u8, flags, s.code]
+    let (kind, code) = s.target.bytes();
+    let flags = (kind & KIND_MASK) | if s.down { DOWN } else { 0 } | if last { LAST } else { 0 };
+    let [lo, hi] = s.delay.to_le_bytes();
+    [lo, hi, flags, code]
 }
 
 /// Decode a mode's macro region into its 32 macros.
@@ -220,18 +259,16 @@ pub fn decode_region(region: &[u8]) -> Result<Vec<Macro>> {
             }
             let b = &region[at..at + STEP];
             steps.push(Step {
-                kind: b[2] & KIND_MASK,
+                target: Target::from_bytes(b[2], b[3]),
                 down: b[2] & DOWN != 0,
-                code: b[3],
-                delay: u16::from(b[0]) | u16::from(b[1]) << 8,
+                delay: u16::from_le_bytes([b[0], b[1]]),
             });
             if b[2] & LAST != 0 {
                 break;
             }
             at += STEP;
         }
-        let empty = steps.len() == 1 && steps[0].kind == 0 && steps[0].code == 0;
-        out.push(Macro(if empty { Vec::new() } else { steps }));
+        out.push(Macro::new(steps));
     }
     Ok(out)
 }
@@ -254,7 +291,7 @@ pub fn encode_region(macros: &[Macro]) -> Result<Vec<u8>> {
         offsets[i] = at;
         let steps: Vec<[u8; STEP]> = if m.0.is_empty() {
             empty_at.get_or_insert(at);
-            vec![[0, 0, LAST, 0]]
+            vec![EMPTY_STEP]
         } else {
             m.0.iter()
                 .enumerate()
@@ -275,7 +312,7 @@ pub fn encode_region(macros: &[Macro]) -> Result<Vec<u8>> {
             if at + STEP > MACRO_BYTES {
                 bail!("macros do not fit the {MACRO_BYTES}-byte region");
             }
-            region[at..at + STEP].copy_from_slice(&[0, 0, LAST, 0]);
+            region[at..at + STEP].copy_from_slice(&EMPTY_STEP);
             at
         }
     };
@@ -386,8 +423,46 @@ mod tests {
         }
         assert!("C sideways".parse::<Step>().is_err());
         assert!("CODE(64,1) down".parse::<Step>().is_err());
-        assert!("CODE(0,0) up".parse::<Step>().is_err());
         assert!("C down x".parse::<Step>().is_err());
+    }
+
+    /// Every kind and code a region can hold prints as a step that parses
+    /// back to the same bytes, kind 0 included.
+    #[test]
+    fn every_step_round_trips() {
+        for kind in 0..=KIND_MASK {
+            for code in [0u8, 1, 2, 0x29, 0x80, 0xc0, 0xff] {
+                for down in [false, true] {
+                    let step = Step {
+                        target: Target::from_bytes(kind, code),
+                        down,
+                        delay: 7,
+                    };
+                    let back: Step = step.to_string().parse().unwrap();
+                    assert_eq!(step_bytes(&back, false), step_bytes(&step, false), "{step}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_is_only_the_exact_empty_step() {
+        let parse = |steps: &[&str]| {
+            let list = toml::Value::Array(
+                steps
+                    .iter()
+                    .map(|s| toml::Value::String(s.to_string()))
+                    .collect(),
+            );
+            Macro::parse(&list, "m").unwrap()
+        };
+        assert!(parse(&["CODE(0,0) up"]).0.is_empty());
+        assert_eq!(parse(&["CODE(0,0) up 5"]).0.len(), 1);
+        assert_eq!(parse(&["CODE(0,0) up", "A up"]).0.len(), 2);
+        let mut region = encode_region(&vec![Macro::default(); MACRO_COUNT]).unwrap();
+        // A lone kind-0 step with a delay is a step, not an empty macro.
+        region[64..68].copy_from_slice(&[5, 0, LAST, 0]);
+        assert_eq!(decode_region(&region).unwrap()[0].0.len(), 1);
     }
 
     #[test]

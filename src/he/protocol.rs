@@ -40,9 +40,13 @@ fn is_allowed(cmd: u8) -> bool {
             .any(|r| r.get_cmd() == cmd || r.set_cmd() == cmd)
 }
 
-/// Firmware version: two bytes read as hexadecimal digits (`20 01` is 120).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FirmwareVersion(pub u16);
+pub enum FirmwareVersion {
+    /// Old firmware that answers `GetInfo` with its build text alone.
+    TextOnly,
+    /// Two bytes read as hexadecimal digits: `20 01` is 120.
+    Bcd(u16),
+}
 
 impl FirmwareVersion {
     /// Versions the write path was checked against.
@@ -50,8 +54,9 @@ impl FirmwareVersion {
 
     /// The digits as a decimal number, if every one is 0..=9.
     pub fn number(self) -> Option<u32> {
+        let Self::Bcd(v) = self else { return None };
         (0..4).rev().try_fold(0u32, |acc, i| {
-            let digit = u32::from((self.0 >> (4 * i)) & 0xf);
+            let digit = u32::from((v >> (4 * i)) & 0xf);
             (digit < 10).then_some(acc * 10 + digit)
         })
     }
@@ -70,11 +75,29 @@ impl FirmwareVersion {
         }
         Ok(())
     }
+
+    /// As stored in a backup header: 0 for text-only firmware.
+    pub fn to_u16(self) -> u16 {
+        match self {
+            Self::TextOnly => 0,
+            Self::Bcd(v) => v,
+        }
+    }
+
+    pub fn from_u16(v: u16) -> Self {
+        match v {
+            0 => Self::TextOnly,
+            v => Self::Bcd(v),
+        }
+    }
 }
 
 impl fmt::Display for FirmwareVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}", self.0)
+        match self {
+            Self::TextOnly => f.write_str("text-only"),
+            Self::Bcd(v) => write!(f, "{v:x}"),
+        }
     }
 }
 
@@ -224,20 +247,21 @@ fn parse_info(r: &Report) -> FirmwareInfo {
     if d[..3].iter().all(u8::is_ascii_alphabetic) {
         // Old firmware answers with the build text alone.
         return FirmwareInfo {
-            version: FirmwareVersion(0x100),
+            version: FirmwareVersion::TextOnly,
             built: text(&d),
         };
     }
     FirmwareInfo {
-        version: FirmwareVersion(u16::from(d[1]) << 8 | u16::from(d[0])),
+        version: FirmwareVersion::Bcd(u16::from_le_bytes([d[0], d[1]])),
         built: text(&d[2..]),
     }
 }
 
-/// Firmware 100..=109 keeps the mode byte of `GetBase` 8 bytes further in.
+/// Text-only firmware and 100..=109 keep the mode byte of `GetBase` 8 bytes
+/// further in.
 fn base_offset(version: FirmwareVersion) -> usize {
-    match version.number() {
-        Some(100..=109) => 8,
+    match (version, version.number()) {
+        (FirmwareVersion::TextOnly, _) | (_, Some(100..=109)) => 8,
         _ => 0,
     }
 }
@@ -301,7 +325,7 @@ mod tests {
         r[9] = 0x01;
         r[10..30].copy_from_slice(b"Jan 27 2026,10:56:00");
         let info = parse_info(&r);
-        assert_eq!(info.version, FirmwareVersion(0x120));
+        assert_eq!(info.version, FirmwareVersion::Bcd(0x120));
         assert_eq!(info.version.to_string(), "120");
         assert_eq!(info.built, "Jan 27 2026,10:56:00");
         assert_eq!(base_offset(info.version), 0);
@@ -321,12 +345,22 @@ mod tests {
 
     #[test]
     fn firmware_versions() {
-        assert_eq!(FirmwareVersion(0x120).number(), Some(120));
-        assert!(FirmwareVersion(0x120).writes_supported());
-        assert!(!FirmwareVersion(0x109).writes_supported());
-        assert!(!FirmwareVersion(0x140).writes_supported());
-        assert_eq!(FirmwareVersion(0x10a).number(), None);
-        assert!(FirmwareVersion(0x10a).check_writes().is_err());
-        assert_eq!(base_offset(FirmwareVersion(0x105)), 8);
+        use FirmwareVersion::{Bcd, TextOnly};
+        assert_eq!(Bcd(0x120).number(), Some(120));
+        assert!(Bcd(0x120).writes_supported());
+        assert!(!Bcd(0x109).writes_supported());
+        assert!(!Bcd(0x140).writes_supported());
+        assert_eq!(Bcd(0x10a).number(), None);
+        assert!(Bcd(0x10a).check_writes().is_err());
+        assert!(!TextOnly.writes_supported());
+        assert_eq!(base_offset(Bcd(0x105)), 8);
+        assert_eq!(base_offset(TextOnly), 8);
+        assert_eq!(base_offset(Bcd(0x120)), 0);
+        assert_eq!(FirmwareVersion::from_u16(TextOnly.to_u16()), TextOnly);
+        assert_eq!(FirmwareVersion::from_u16(0x120), Bcd(0x120));
+
+        let mut r = [0u8; REPORT_LEN];
+        r[8..13].copy_from_slice(b"Build");
+        assert_eq!(parse_info(&r).version, TextOnly);
     }
 }

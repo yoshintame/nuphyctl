@@ -8,6 +8,7 @@ mod keycodes;
 mod keymap;
 mod keymap_cmd;
 mod nuphy_protocol;
+mod output;
 
 use anyhow::{Context, Result};
 use clap::Parser;

@@ -7,8 +7,12 @@ pub mod config;
 pub mod layout;
 pub mod macros;
 pub mod names;
+pub mod pending;
 pub mod plan;
 pub mod protocol;
 pub mod region;
 pub mod snapshot;
+pub mod state;
+#[cfg(test)]
+pub mod testutil;
 pub mod travel;

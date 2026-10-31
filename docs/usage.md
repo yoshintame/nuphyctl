@@ -198,10 +198,10 @@ nuphyctl keymap reset --mode windows --yes
 ## Hall-effect boards
 
 The Air60 HE and its Hall-effect siblings speak a different protocol from the
-Air75 V3: no session key, and a key matrix of three modes (`m1`..`m3`, as NuPhy
-IO labels them) with four layers each (`base`, `fn1`, `fn2`, `fn3`), plus a
-per-key travel table per mode. These commands live under `he`; only the
-Air60 HE layout has named positions so far.
+Air75 V3: no session key, a key matrix of three modes (`m1`..`m3`, as NuPhy IO
+labels them) with four layers each, a per-key travel table per mode, and 32
+macros per mode. These commands live under `he`; only the Air60 HE layout has
+named positions so far.
 
 ```bash
 nuphyctl he info
@@ -216,11 +216,12 @@ nuphyctl he restore-backup ~/.local/state/nuphyctl/he-<stamp>.bin
 
 The config lists only what it changes; travel values are millimetres and unset
 fields keep the keyboard's value. `"*"` applies to every key of the mode and a
-key's own entry overrides it field by field:
+key's own entry overrides it field by field. Removing a line does not undo it
+on the keyboard: set the key back to its factory value instead.
 
 ```toml
 [m1.base]
-CAPS = "FN(2)"            # momentary layer, absolute number (m1 = 0..3)
+CAPS = "FN(2)"            # momentary layer, absolute number
 
 [m1.fn2]
 I = "UP"
@@ -228,9 +229,12 @@ S = "LSFT"
 M = "MACRO(1)"
 "#58" = "LCTL+C"
 
+[m2.fn5]                  # m2's layers: base (fn4), fn5, fn6, fn7
+I = "UP"
+
 [m1.travel]
-"*" = { actuation = 1.5, trigger = "normal" }
-W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
+"*" = { trigger = "normal", actuation = 1.5 }
+W = { trigger = "rapid", actuation = 0.5, press = 0.1, release = 0.1 }
 
 [m1.macros]               # 1..32 as NuPhy IO numbers them, bound as MACRO(n)
 5 = "LCTL+C"              # chord: modifiers down, key tap, modifiers up
@@ -238,27 +242,38 @@ W = { actuation = 0.5, trigger = "rapid", press = 0.1, release = 0.1 }
 4 = []                    # empty
 ```
 
-A layer can also be named the way NuPhy IO numbers them across modes:
-`[m3.fn11]` is the same as `[m3.fn3]`.
+Layers are numbered across modes the way NuPhy IO numbers them: `base` (also
+`fn0` / `fn4` / `fn8`) is a mode's first layer, then `fn1`..`fn3` in m1,
+`fn5`..`fn7` in m2 and `fn9`..`fn11` in m3. `FN(n)` in an action uses the same
+absolute numbers.
 
 Actions are key names with optional modifiers (`LCTL+C`), media names (`VOLU`,
 `MUTE`), `FN(n)`, `MACRO(n)`, keyboard functions (`SLEEP`, `LIGHT_TOGGLE`) or
 raw `0xKKAABB`. Fields of a travel entry: `actuation`, `trigger` (`normal`,
-`rapid`, `continuous`), `press`, `release`, `upper_deadzone`, `lower_deadzone`.
+`rapid`, `continuous`, or a raw `0`..`15`), `press`, `release`,
+`upper_deadzone`, `lower_deadzone`.
 
 Writes are deliberately narrow:
 
 - Only key actions, travel records and macro regions are written, and only the
   entries that differ (a changed mode's macros are re-laid out the way NuPhy IO
   lays them out). The G-key bytes past the 128 matrix slots are never written.
-- DKS, Mod-Tap, Toggle and Snap Tap keys are refused; assign or remove those in
-  NuPhy IO.
+- DKS, Mod-Tap, Toggle and Snap Tap keys, and kinds this tool does not know,
+  are neither assigned nor replaced; change those in NuPhy IO. Keyboard
+  functions it does not assign (mode switches, some lighting keys) can still
+  be replaced.
 - Factory reset and the firmware loader are never put on a key, not even from a
   backup, and no command outside the region reads and writes is ever sent.
 - Only the Air60 HE (`19f5:fee0`) is talked to: it is the one layout known.
+- `--dry-run` runs every check a real run does, so it fails where a write
+  would.
 - Before writing, the matrix, travel tables and macros are saved to
   `$XDG_STATE_HOME/nuphyctl/he-<stamp>.bin`; afterwards they are read back and
   the command fails unless they match.
+- Until a write is verified, `$XDG_STATE_HOME/nuphyctl/he-pending` names its
+  backup. While it exists, `apply` and `export` refuse: a write that stopped
+  half way can leave macros that decode but are wrong. `restore-backup`
+  clears it.
 
 Backups start with a header (format version, vendor and product id, firmware
 version). `restore-backup` refuses a backup of another board and notes a
